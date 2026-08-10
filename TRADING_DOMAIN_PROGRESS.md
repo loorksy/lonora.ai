@@ -49,7 +49,7 @@ full `pytest` suite and `alembic upgrade head` in a real dev/CI environment**
 | 4. Trading charts (klinecharts, web) | ✅ Done | |
 | 5. Approval-gated proposals (risk engine, position sizing, RBAC, execution) | ✅ Done | See below — includes a pre-existing platform bug fix |
 | 6. Telegram + WhatsApp (buttons, chart images) | ✅ Done | Includes a minimal web dashboard page |
-| 7. MCP Apps / ext-apps investigation | ⬜ Not started | |
+| 7. MCP Apps / ext-apps investigation | 🔍 Investigated — deferred | Not implemented; see rationale below |
 | 8. Production hardening (observability, docs, rate limiting) | ⬜ Not started | |
 
 ---
@@ -552,5 +552,95 @@ below ran against a real local Postgres 16 test database + real
   `whatsapp_webhook_service.py` 3=3, `controllers/trading.py` 1=1,
   `telegram_polling_service.py` 4=4, `models/telegram_bot.py` 1=1,
   `models/whatsapp_bot.py` 1=1.
+
+---
+
+## Phase 7 — MCP Apps / ext-apps investigation 🔍 Investigated, deferred
+
+The plan gated this phase explicitly: "only if the ext-apps spec is
+confirmed feasible against the actual installed MCP SDK version at that
+time." It isn't — this section documents why, precisely, so a future pass
+doesn't have to redo this research.
+
+### What was checked
+
+1. **Installed SDK**: `mcp==1.28.1` (pulled in transitively via
+   `fastmcp==3.2.4`, per `api/uv.lock`). Installed it standalone
+   (`pip install --no-deps mcp==1.28.1`) into a scratch dir and inspected
+   `mcp/types.py` directly rather than trusting docs/memory.
+2. **Capability surface**: `ServerCapabilities`/`ClientCapabilities` in
+   this SDK version cover `roots`, `sampling`, `elicitation`, `tasks`,
+   `prompts`, `resources`, `tools`, `logging`, `completions` — **no
+   dedicated "apps" or "ui" capability exists**. "MCP Apps" (the `ui://`
+   interactive-resource proposal, sometimes called MCP-UI) is not a
+   first-class part of the base protocol this SDK implements; it is a
+   community/vendor convention layered on top of the existing generic
+   `EmbeddedResource` content-block type (`type: "resource"`, arbitrary
+   URI, arbitrary `mimeType` e.g. `text/html`) — which the SDK **does**
+   support structurally, since `EmbeddedResource`/`ResourceLink` are
+   already part of `ContentBlock` in 1.28.1. So there's no SDK-version
+   blocker to constructing such a content block; the blocker is entirely
+   on the client-rendering side (next point).
+3. **How Synkora actually exposes MCP today**: `api/src/services/agents/mcp_server_host_service.py`
+   is a **hand-rolled JSON-RPC 2.0 server**, not built on the `mcp` Python
+   SDK's server classes at all (no `import mcp`/`from mcp import ...`
+   anywhere in that file). It declares only `"capabilities": {"tools": {}}`
+   at `initialize` and its `tools/call` handler for the "chat" tool
+   returns only `{"type": "text", "text": ...}` content blocks — no
+   `resources` capability declared, no `EmbeddedResource` ever
+   constructed. This is the **only** MCP surface Synkora exposes outward
+   (confirmed in the original audit) — external clients (Claude Desktop,
+   etc.) reach a Synkora agent exclusively through this single "chat"
+   tool, never through a richer, per-capability MCP tool set.
+4. **Where the value would land**: Synkora's **own** web chat UI does not
+   consume MCP protocol messages for its own agents' tool calls at all —
+   the Phase 4 klinecharts candlestick chart already reaches the browser
+   through the existing, unrelated `message.metadata.charts` mechanism.
+   So a `ui://` interactive chart embedded in an MCP tool result would
+   only ever be visible to an **external third-party MCP client** chatting
+   with the hosted Trading Agent — never to Synkora's own users, who
+   already get a strictly better native chart today.
+
+### Why this is deferred, not built
+
+- The actual gating uncertainty isn't the SDK version, it's whether **any**
+  MCP client this could plausibly be tested against actually renders a
+  `ui://`/HTML `EmbeddedResource` as a sandboxed interactive surface
+  rather than inert content. No such client is available in this sandbox
+  to verify against, and the proposal itself was still evolving/
+  non-finalized as of this session — shipping against an unstable,
+  unverifiable external-client behavior is exactly the kind of
+  unverified-guess work this whole engagement has deliberately avoided
+  (see the verification methodology used in every other phase).
+- The benefit is narrow even if it worked: only external MCP clients
+  benefit, and only for the Trading Agent's single bundled "chat" tool —
+  Synkora's own users already have the richer native chart.
+- Building it would mean hand-constructing spec-adjacent JSON inside
+  `mcp_server_host_service.py`'s manual JSON-RPC responses with no way to
+  confirm it round-trips correctly against a real client, which fails
+  this project's own verification bar.
+
+### What a future pass should do instead of starting from scratch
+
+1. Re-check whether `mcp` has shipped an official `apps`/`ui` capability
+   (`ServerCapabilities`/`ClientCapabilities` in `mcp/types.py`) — if so,
+   the spec has stabilized and this is worth revisiting.
+2. Identify a concrete target client that has *confirmed, testable*
+   `ui://`/HTML-resource rendering support, and validate against it
+   directly rather than guessing at the wire format.
+3. If both of the above hold, the additive change is small and isolated:
+   add a `resources: {}` capability at `_handle_initialize` (or a new
+   capability key once standardized) and, only for the Trading Agent, let
+   `_handle_tools_call`'s result optionally include an
+   `EmbeddedResource`/`ResourceLink` content block carrying the same
+   `TradingChartData` payload the web klinecharts renderer already
+   consumes (`web/lib/types/trading.ts`) — same data shape, two render
+   targets. The existing `{"type": "text", ...}` content block stays
+   first in the list unconditionally, so any client that doesn't
+   understand the resource block still gets a working plain-text
+   response — this is what "additive, doesn't break the legacy JSON chart
+   path" means concretely for this specific integration point.
+
+No code was changed for this phase.
 
 ---
