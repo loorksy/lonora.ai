@@ -1,0 +1,116 @@
+name: Chrome Extension — Build & Publish
+
+on:
+  # Auto-publish on version tags: git tag extension/v0.2.0 && git push --tags
+  push:
+    tags:
+      - "extension/v*"
+  # Manual trigger with optional dry-run
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (build zip but skip Chrome Web Store upload)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+concurrency:
+  group: extension-publish
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build & Publish Extension
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Sync version from tag
+        if: startsWith(github.ref, 'refs/tags/extension/v')
+        working-directory: extension
+        run: |
+          VERSION=${GITHUB_REF_NAME#extension/v}
+          echo "Publishing version: $VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Install dependencies
+        working-directory: extension
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        working-directory: extension
+        run: pnpm type-check
+
+      - name: Run tests
+        working-directory: extension
+        run: pnpm test
+
+      - name: Build extension zip (Chrome)
+        working-directory: extension
+        run: pnpm zip
+
+      - name: Find zip file
+        id: zip
+        working-directory: extension
+        run: |
+          ZIP=$(ls .output/*chrome*.zip 2>/dev/null | head -1)
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: No chrome zip found in .output/" && exit 1
+          fi
+          echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename $ZIP)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload zip as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.zip.outputs.name }}
+          path: extension/${{ steps.zip.outputs.path }}
+          retention-days: 90
+
+      # ── Chrome Web Store upload via service account ──────────────────────
+      # No refresh tokens — service account credentials never expire.
+      #
+      # One-time setup:
+      #   1. Google Cloud Console → IAM → Service Accounts → Create
+      #   2. Grant it "Chrome Web Store API" access (enable the API first)
+      #   3. In Chrome Web Store dashboard → Settings → add service account email as a publisher
+      #   4. Download JSON key → paste full contents as CHROME_SERVICE_ACCOUNT_JSON secret
+      #   5. Add CHROME_EXTENSION_ID secret (from dashboard URL)
+      - name: Publish to Chrome Web Store
+        if: ${{ startsWith(github.ref, 'refs/tags/extension/v') || inputs.dry_run == 'false' }}
+        env:
+          EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          PUBLISHER_ID: ${{ secrets.CHROME_PUBLISHER_ID }}
+          CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+        run: |
+          npx chrome-webstore-upload-cli@4 upload \
+            --source "extension/${{ steps.zip.outputs.path }}" \
+            --extension-id "$EXTENSION_ID"
+
+          npx chrome-webstore-upload-cli@4 publish \
+            --extension-id "$EXTENSION_ID"
+
+      - name: Summary
+        run: |
+          echo "## Chrome Extension Build" >> $GITHUB_STEP_SUMMARY
+          echo "- **File:** ${{ steps.zip.outputs.name }}" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ startsWith(github.ref, 'refs/tags/extension/v') }}" == "true" || "${{ inputs.dry_run }}" == "false" ]]; then
+            echo "- **Published:** yes" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Published:** no (dry run)" >> $GITHUB_STEP_SUMMARY
+          fi

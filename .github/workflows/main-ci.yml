@@ -1,0 +1,157 @@
+name: Main CI Pipeline
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  statuses: write
+
+concurrency:
+  group: main-ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Scan for leaked secrets before running any tests
+  secret-scan:
+    name: Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # Full history so gitleaks can scan all commits in the PR
+      - name: Run Gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks detect --source . --config .gitleaks.toml --redact -v
+
+  # Check which paths were changed to determine which tests to run
+  check-changes:
+    name: Check Changed Files
+    runs-on: ubuntu-latest
+    outputs:
+      api-changed: ${{ steps.changes.outputs.api }}
+      web-changed: ${{ steps.changes.outputs.web }}
+      mobile-changed: ${{ steps.changes.outputs.mobile }}
+      migration-changed: ${{ steps.changes.outputs.migration }}
+      docker-changed: ${{ steps.changes.outputs.docker }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            api:
+              - 'api/**'
+              - 'docker-compose.yml'
+              - '.github/workflows/api-tests.yml'
+            web:
+              - 'web/**'
+              - '.github/workflows/web-tests.yml'
+            mobile:
+              - 'flutter/synkora_mobile/**'
+              - '.github/workflows/mobile-ci.yml'
+              - '.github/workflows/mobile-release.yml'
+            migration:
+              - 'api/migrations/**'
+              - '.github/workflows/db-migration-test.yml'
+            docker:
+              - 'docker-compose.yml'
+              - 'api/Dockerfile'
+              - 'web/Dockerfile'
+              - 'services/ml/**'
+              - 'services/scraper/**'
+              - '.github/workflows/docker-build.yml'
+
+  style-check:
+    name: Style Check
+    uses: ./.github/workflows/style.yml
+
+  # Run tests in parallel — only after style check passes
+  api-tests:
+    name: API Tests
+    needs: [check-changes, style-check]
+    if: needs.check-changes.outputs.api-changed == 'true'
+    uses: ./.github/workflows/api-tests.yml
+
+  web-tests:
+    name: Web Tests
+    needs: [check-changes, style-check]
+    if: needs.check-changes.outputs.web-changed == 'true'
+    uses: ./.github/workflows/web-tests.yml
+
+  mobile-tests:
+    name: Mobile Tests
+    needs: [check-changes, style-check]
+    if: needs.check-changes.outputs.mobile-changed == 'true'
+    uses: ./.github/workflows/mobile-ci.yml
+
+  db-migration-test:
+    name: DB Migration Test
+    needs: [check-changes, style-check]
+    if: needs.check-changes.outputs.migration-changed == 'true'
+    uses: ./.github/workflows/db-migration-test.yml
+
+  docker-build:
+    name: Docker Build Test
+    needs: [check-changes, style-check]
+    if: needs.check-changes.outputs.docker-changed == 'true'
+    uses: ./.github/workflows/docker-build.yml
+
+  dependency-scan:
+    name: Dependency Vulnerability Scan (SCA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv and pip-audit
+        run: pip install uv pip-audit
+
+      - name: Export pinned requirements from pyproject.toml
+        working-directory: api
+        run: uv export --no-hashes --no-emit-project --format requirements-txt -o /tmp/requirements-audit.txt
+
+      - name: Scan Python dependencies (pip-audit)
+        run: |
+          pip-audit \
+            --requirement /tmp/requirements-audit.txt \
+            --ignore-vuln CVE-2025-69872 \
+            --ignore-vuln CVE-2026-35029 \
+            --ignore-vuln GHSA-69x8-hrgq-fjj8 \
+            --ignore-vuln PYSEC-2026-1325 \
+            --format markdown \
+            --output api/pip-audit-report.md
+        continue-on-error: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Scan frontend dependencies (pnpm audit)
+        working-directory: web
+        run: pnpm audit --audit-level=high
+
+      - name: Upload pip-audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: api/pip-audit-report.md
+          retention-days: 30

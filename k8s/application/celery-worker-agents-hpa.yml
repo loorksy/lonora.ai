@@ -1,0 +1,40 @@
+# DISABLED — replaced by celery-worker-agents-keda.yml (KEDA ScaledObject).
+# Kept here for rollback reference. To re-enable: delete the ScaledObject and
+# remove this comment block, then apply this file.
+#
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+metadata:
+  name: synkora-celery-worker-agents-hpa
+  namespace: synkora-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: synkora-celery-worker-agents
+  minReplicas: 1
+  # 7-node cluster (s-2vcpu-4gb). Agents pod requests 1Gi/500m.
+  # Capped at 4 to prevent cluster OOM. Raise alongside cluster node count.
+  maxReplicas: 1
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Agent tasks can run up to 55 minutes (soft limit). Wait longer before
+      # scaling down to avoid killing in-progress tasks on pod termination.
+      stabilizationWindowSeconds: 600
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 120
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 60

@@ -1,0 +1,120 @@
+name: Run API Tests
+
+on:
+  workflow_call:
+  workflow_dispatch:  # Allow manual trigger for local testing with act
+
+concurrency:
+  group: api-tests-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: API Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: api
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: synkora
+          POSTGRES_PASSWORD: synkora
+          POSTGRES_DB: synkora_test
+        ports:
+          - 5439:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Use CI test environment
+        run: cp .env.test.ci .env.test
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install system dependencies for xmlsec
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev --extra llm
+
+      - name: Audit Python dependencies for CVEs
+        run: |
+          uv export --no-hashes --no-emit-project --format requirements-txt -o /tmp/requirements-audit.txt
+          uvx pip-audit \
+            --requirement /tmp/requirements-audit.txt \
+            --ignore-vuln CVE-2025-69872 \
+            --ignore-vuln CVE-2026-35029 \
+            --ignore-vuln GHSA-69x8-hrgq-fjj8 \
+            --ignore-vuln PYSEC-2026-1325
+
+      - name: Run unit tests
+        env:
+          TESTING: "true"
+        run: |
+          uv run pytest tests/unit/ -v --color=yes --cov=src --cov-report=xml --cov-report=term --cov-report=html
+
+      - name: Run integration tests
+        env:
+          TESTING: "true"
+        run: |
+          uv run pytest tests/integration/ -v --color=yes -m "not e2e" --cov=src --cov-append --cov-report=xml --cov-report=term --cov-report=html
+
+      - name: Generate coverage report
+        run: |
+          uv run coverage report --skip-empty | tee coverage-report.txt
+          # Extract coverage percentage
+          COVERAGE=$(uv run coverage report --skip-empty | grep "TOTAL" | awk '{print $NF}' | sed 's/%//')
+          echo "COVERAGE=$COVERAGE" >> $GITHUB_ENV
+          echo "Coverage: $COVERAGE%"
+
+      - name: Create coverage badge
+        if: github.ref == 'refs/heads/master'
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        continue-on-error: true
+        with:
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: ${{ vars.COVERAGE_GIST_ID }}
+          filename: coverage-badge.json
+          label: coverage
+          message: ${{ env.COVERAGE }}%
+          valColorRange: ${{ env.COVERAGE }}
+          minColorRange: 0
+          maxColorRange: 100
+
+      - name: Upload coverage HTML report
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
+        if: always()
+        with:
+          name: coverage-report-py3.11
+          path: htmlcov/
+          retention-days: 30

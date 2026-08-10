@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synkora-celery-worker-billing
+  namespace: synkora-production
+  labels:
+    app: synkora
+    component: celery-worker-billing
+    version: v1
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: synkora
+      component: celery-worker-billing
+  template:
+    metadata:
+      labels:
+        app: synkora
+        component: celery-worker-billing
+        version: v1
+    spec:
+      imagePullSecrets:
+      - name: ecr-registry-secret
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: celery-worker-billing
+        image: IMAGE_PLACEHOLDER
+        imagePullPolicy: Always
+        command: ["celery"]
+        # Handles: credit deduction, usage analytics flush, daily credit reconciliation.
+        # Tasks are short-lived DB writes — low memory, serialized execution preferred.
+        args: ["-A", "src.celery_app", "worker", "--loglevel=info", "-Q", "billing",
+               "--concurrency=2"]
+        envFrom:
+        - configMapRef:
+            name: synkora-config
+        - secretRef:
+            name: synkora-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+      # Billing tasks are short DB writes (< 60s). 90s gives enough headroom.
+      terminationGracePeriodSeconds: 90
