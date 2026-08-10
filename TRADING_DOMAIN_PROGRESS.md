@@ -46,7 +46,7 @@ full `pytest` suite and `alembic upgrade head` in a real dev/CI environment**
 | 1. Foundation (models, migration, broker adapters, credentials) | ✅ Done | Commit `4b6bcfa` |
 | 2. Read-only trading tools | ✅ Done | Commit pending (see below) |
 | 3. Trading Agent (config, system prompt, tool allow-list) | ✅ Done | |
-| 4. Trading charts (klinecharts, web) | ⬜ Not started | |
+| 4. Trading charts (klinecharts, web) | ✅ Done | |
 | 5. Approval-gated proposals (risk engine, position sizing, RBAC, execution) | ⬜ Not started | |
 | 6. Telegram + WhatsApp (buttons, chart images) | ⬜ Not started | |
 | 7. MCP Apps / ext-apps investigation | ⬜ Not started | |
@@ -186,5 +186,58 @@ sandbox** (needs the full app + a real Postgres + an existing tenant/account
 `python seed_trading_agent.py --tenant-id <uuid>` in a real environment
 before relying on it, and confirm the created Agent shows up correctly in
 the Agent Builder UI with all 10 trading tools attached.
+
+---
+
+## Phase 4 — Trading charts (klinecharts) ✅
+
+**Data model** (`web/lib/types/trading.ts`): `TradingChartData` (symbol,
+timeframe, source, `bars: OHLCBar[]`, `overlays: {entry, stopLoss,
+takeProfit[], supportResistance[], trendlines[]}`) — kept independent of
+klinecharts' own types, per the plan's "keep chart data model independent
+from the rendering library" requirement.
+
+**Renderer** (`web/components/charts/renderers/KLineChartsRenderer.tsx`):
+wired into `ChartRenderer.tsx`'s existing `chart.library` switch as a new
+`'klinecharts'` case, alongside `chartjs`/`recharts`/`plotly` — no changes
+to the existing three paths, confirmed by re-running `tsc --noEmit` clean
+across the whole web app.
+
+**Important API-version finding**: klinecharts v10 (the current npm
+`latest`, installed here) is not the same imperative `applyNewData(...)`
+API most tutorials/blog posts describe (that's v9). v10 uses a
+**DataLoader** pattern (`chart.setDataLoader({ getBars: ({callback}) =>
+callback(data, hasMore) })`) plus `setSymbol`/`setPeriod`. This session had
+no live access to klinecharts.com (blocked by the sandbox's egress proxy)
+to confirm this from the docs site, so the implementation was built by
+downloading the actual npm package (`npm pack klinecharts@10.0.2`) and
+reading its bundled `dist/index.d.ts` directly — the authoritative source.
+Confirmed overlay type names by grepping the bundled JS for known
+identifiers: `priceLine` (used for entry/SL/TP — a labeled horizontal
+line), `horizontalStraightLine` (support/resistance), `segment` (trendlines,
+2 points).
+
+**Verified — this one got a real browser test, not just lint**: `pnpm
+install` (klinecharts 10.0.2 resolved cleanly), `tsc --noEmit` clean across
+the whole app, `eslint` clean on all 3 touched/new files. Then: wrote a
+temporary standalone Next.js page rendering `<ChartRenderer>` with 120
+generated candles + entry/SL/TP/support-resistance/trendline overlays,
+started the real `next dev` server, loaded the page in headless Chromium
+via Playwright, and confirmed **zero console/page errors**, 10 canvas
+elements rendered (klinecharts' multi-layer canvas architecture — main
+pane + volume pane + overlay layers), and visually confirmed via screenshot
+that candlesticks, the VOL/MA volume sub-pane, and all overlay price lines
+with their colored labels rendered correctly. The test page was then
+deleted — it was scaffolding only, not a real route.
+
+**Known follow-up, not blocking**: `ChartRenderer.tsx`'s PNG-download
+button grabs the first `<canvas>` it finds in the container, which works
+fine for Chart.js (single canvas) but will only capture klinecharts' first
+internal layer, not the composited full chart. klinecharts exposes
+`chart.getConvertPictureUrl()` for a correct full-chart export; wiring that
+in would need an imperative handle/ref from `KLineChartsRenderer` up to
+`ChartRenderer` — left as a follow-up since it's a cosmetic gap (download
+still produces *a* PNG, just possibly a partial one), not a functional
+break, and this phase's scope was chart rendering, not export tooling.
 
 ---

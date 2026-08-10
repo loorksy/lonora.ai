@@ -24,6 +24,11 @@ const PlotlyRenderer = dynamic(
   { ssr: false, loading: () => <ChartPlaceholder /> }
 )
 
+const KLineChartsRenderer = dynamic(
+  () => import('./renderers/KLineChartsRenderer').then((m) => ({ default: m.KLineChartsRenderer })),
+  { ssr: false, loading: () => <ChartPlaceholder /> }
+)
+
 function ChartPlaceholder() {
   return (
     <div className="flex items-center justify-center h-full text-gray-300 text-sm animate-pulse">
@@ -94,6 +99,8 @@ export function ChartRenderer({ chart, className = '' }: ChartRendererProps) {
         return <RechartsRenderer chart={chart} />
       case 'plotly':
         return <PlotlyRenderer chart={chart} />
+      case 'klinecharts':
+        return <KLineChartsRenderer chart={chart} />
       default:
         return <ChartJSRenderer chart={chart} />
     }

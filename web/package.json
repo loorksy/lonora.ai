@@ -32,6 +32,7 @@
     "dayjs": "^1.11.13",
     "dompurify": "^3.3.0",
     "gsap": "^3.14.2",
+    "klinecharts": "^10.0.2",
     "lucide-react": "^0.546.0",
     "mermaid": "^11.12.2",
     "motion": "^12.23.26",
