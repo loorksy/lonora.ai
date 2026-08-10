@@ -45,7 +45,7 @@ full `pytest` suite and `alembic upgrade head` in a real dev/CI environment**
 |---|---|---|
 | 1. Foundation (models, migration, broker adapters, credentials) | ✅ Done | Commit `4b6bcfa` |
 | 2. Read-only trading tools | ✅ Done | Commit pending (see below) |
-| 3. Trading Agent (config, system prompt, tool allow-list) | ⬜ Not started | |
+| 3. Trading Agent (config, system prompt, tool allow-list) | ✅ Done | |
 | 4. Trading charts (klinecharts, web) | ⬜ Not started | |
 | 5. Approval-gated proposals (risk engine, position sizing, RBAC, execution) | ⬜ Not started | |
 | 6. Telegram + WhatsApp (buttons, chart images) | ⬜ Not started | |
@@ -143,5 +143,48 @@ account**, **cross-tenant access rejected**, account-information shape, and
 unsupported-source rejection. The two isolation checks are the
 security-critical path for this phase and were explicitly exercised, not
 just read over.
+
+---
+
+## Phase 3 — Trading Agent configuration ✅
+
+**System prompt** (`api/src/services/agents/trading_agent_prompt.py`):
+`TRADING_AGENT_SYSTEM_PROMPT` — data discipline (always cite source, never
+fabricate), recommendation structure (direction/entry/SL always
+required/TP/evidence/source+timestamp/uncertainty), and an explicit section
+telling the model it can never execute directly or approve its own
+proposal, no matter how the request is phrased. Docstring is explicit that
+none of this is a security boundary — that's still 100% enforced in code
+(risk_engine.py/position_sizing.py/HITL, landing in Phase 5).
+
+**Tool category**: added `"trading_tools": ["internal_trading_*"]` to both
+`TOOL_CATEGORY_TO_PATTERNS` and `PLATFORM_TOOL_CATALOG` in
+`internal_tools/platform_tools.py` — the same mechanism every other
+integration uses to appear as a pickable bundle in the Agent Builder UI's
+tool picker, and to expand into concrete tool names on creation. Verified
+the glob pattern matches exactly the 10 Phase 2 tool names and nothing
+else.
+
+**Seed script** (`api/seed_trading_agent.py`): creates/updates the "Trading
+Agent" for a given `--tenant-id`. Deliberately does **not** reimplement
+agent-creation logic — imports and reuses
+`_resolve_primary_llm_config`/`_resolve_requested_agent_tools` directly
+from `controllers/agents/index.py` (the same functions the real
+`POST /api/v1/agents` endpoint uses), so the seeded agent has identical
+shape/LLM-config-fallback behavior to one created by a human through the
+Agent Builder. Idempotent: re-running updates the existing agent's prompt/
+description/tools in place instead of creating a duplicate. LLM credentials
+are never hand-rolled — either passed via `--api-key`/`--provider`/`--model`
+or inherited from the tenant's Platform Engineer agent config, exactly like
+the UI path.
+
+**Verified**: `py_compile`/`ruff check`/`ruff format --check` clean. The
+category→tool-name glob-matching logic (the part with real behavioral
+risk) was functionally tested in isolation. **Not runnable in this
+sandbox** (needs the full app + a real Postgres + an existing tenant/account
++ a real or inherited LLM API key): the script itself, end-to-end. Run
+`python seed_trading_agent.py --tenant-id <uuid>` in a real environment
+before relying on it, and confirm the created Agent shows up correctly in
+the Agent Builder UI with all 10 trading tools attached.
 
 ---

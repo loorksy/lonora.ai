@@ -267,6 +267,15 @@ PLATFORM_TOOL_CATALOG = {
         "description": "Spawn another agent as a sub-task (multi-agent orchestration)",
         "requires_oauth": [],
     },
+    "trading_tools": {
+        "description": (
+            "Read-only Forex/trading market data and account inspection: live quotes, OHLC candles, "
+            "instrument specs, and — for the user's own linked MetaApi account — balance, positions, "
+            "orders, trade history, and margin estimation. No tool in this category can place, modify, "
+            "or close anything; execution always goes through a separate approval-gated proposal tool."
+        ),
+        "requires_oauth": [],
+    },
 }
 
 
@@ -885,6 +894,7 @@ TOOL_CATEGORY_TO_PATTERNS: dict[str, list[str]] = {
     "linkedin_tools": ["internal_linkedin_*"],
     "youtube_tools": ["internal_youtube_*"],
     "spawn_agent_tool": ["spawn_agent", "check_task", "list_background_tasks", "call_remote_agent"],
+    "trading_tools": ["internal_trading_*"],
 }
 
 
