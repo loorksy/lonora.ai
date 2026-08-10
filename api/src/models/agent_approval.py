@@ -15,7 +15,9 @@ class ApprovalStatus(enum.StrEnum):
     APPROVED = "approved"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    EXECUTING = "executing"
     EXECUTED = "executed"
+    FAILED = "failed"
 
 
 class AgentApprovalRequest(Base):
@@ -23,7 +25,7 @@ class AgentApprovalRequest(Base):
     Persists a pending human approval gate for an autonomous agent action.
 
     Lifecycle:
-      PENDING → APPROVED (user said yes) → EXECUTED (tool ran)
+      PENDING → APPROVED (user said yes) → EXECUTING → EXECUTED (tool ran) / FAILED
       PENDING → REJECTED (user said no or gave feedback)
       PENDING → EXPIRED  (TTL elapsed without reply)
     """

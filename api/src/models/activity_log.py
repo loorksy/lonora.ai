@@ -26,6 +26,7 @@ class ActivityType(StrEnum):
     RESOURCE = "RESOURCE"  # Resource access, modifications
     SECURITY = "SECURITY"  # Security events, permission changes
     SYSTEM = "SYSTEM"  # System-level events
+    TRADING = "TRADING"  # Trade proposals, approvals, executions
 
 
 class ActivityLog(BaseModel):

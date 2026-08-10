@@ -93,6 +93,7 @@ from .permission import Permission
 from .phone_call import PhoneCall, PhoneCallStatus
 from .phone_number import PhoneNumber
 from .phone_provider_credential import PhoneProviderCredential
+from .platform_broker_credential import PlatformBrokerCredential
 from .platform_settings import PlatformSettings
 from .project import Project, ProjectStatus
 from .project_agent import ProjectAgent
@@ -124,6 +125,10 @@ from .tenant_subscription import BillingCycle, SubscriptionStatus, TenantSubscri
 from .test_result import MetricType, PercentileType, TestResult
 from .test_run import TestRun, TestRunStatus
 from .test_scenario import TestScenario
+from .trade_execution import TradeExecution
+from .trade_proposal import TradeProposal, TradeProposalStatus
+from .trading_account import TradingAccount
+from .trading_configuration import RiskConfiguration
 from .upload_file import FileSource, FileType, UploadFile
 from .usage_analytics import UsageAnalytics
 from .user_oauth_token import UserOAuthToken
@@ -366,4 +371,11 @@ __all__ = [
     "SCIMToken",
     # Portal models
     "TenantPortal",
+    # Trading domain models
+    "PlatformBrokerCredential",
+    "TradingAccount",
+    "RiskConfiguration",
+    "TradeProposal",
+    "TradeProposalStatus",
+    "TradeExecution",
 ]
