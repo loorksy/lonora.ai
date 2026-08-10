@@ -506,6 +506,20 @@ class TelegramPollingService:
             return
 
         tg_conv.linked_account_id = UUID(account_id)
+
+        from ...models.activity_log import ActivityLog, ActivityType
+
+        self.db_session.add(
+            ActivityLog.log_activity(
+                action="trading.channel_linked",
+                activity_type=ActivityType.TRADING,
+                account_id=account_id,
+                tenant_id=tenant_id,
+                resource_type="telegram_conversation",
+                resource_id=str(tg_conv.id),
+                description=f"Telegram chat {chat_id} linked to account {account_id} for trade approval",
+            )
+        )
         await self.db_session.commit()
         await bot.send_message(
             chat_id=chat_id,

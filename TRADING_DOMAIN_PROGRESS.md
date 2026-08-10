@@ -50,7 +50,7 @@ full `pytest` suite and `alembic upgrade head` in a real dev/CI environment**
 | 5. Approval-gated proposals (risk engine, position sizing, RBAC, execution) | ✅ Done | See below — includes a pre-existing platform bug fix |
 | 6. Telegram + WhatsApp (buttons, chart images) | ✅ Done | Includes a minimal web dashboard page |
 | 7. MCP Apps / ext-apps investigation | 🔍 Investigated — deferred | Not implemented; see rationale below |
-| 8. Production hardening (observability, docs, rate limiting) | ⬜ Not started | |
+| 8. Production hardening (observability, docs, rate limiting) | ✅ Done | Closes a real deployment gap (credential seeding) |
 
 ---
 
@@ -644,3 +644,171 @@ doesn't have to redo this research.
 No code was changed for this phase.
 
 ---
+
+## Phase 8 — Production hardening ✅ (commit pending)
+
+**Goal**: rate limiting, retry/error-handling, observability, and deployment
+documentation for the trading domain — extending existing platform infra in
+each case (RULE 15), plus closing a real gap this pass surfaced: nothing in
+the codebase actually provisions the platform-owned broker credentials the
+whole domain depends on.
+
+### Rate limiting
+
+Extended `RateLimitMiddleware.ENDPOINT_LIMITS` (`api/src/middleware/rate_limit_middleware.py`)
+— no new mechanism, this is the platform's only rate-limiting infra
+(Redis sliding-window, path-prefix keyed). Added:
+- `/api/v1/trading/channel-link/generate`: 5/min — each call mints a fresh
+  one-time code; tight to limit enumeration/abuse.
+- `/api/v1/trading/`: 30/min general — everything else (quotes, proposals,
+  approve/reject) is authenticated, tenant-scoped, human-paced activity.
+
+The more specific prefix is listed first, since `_get_limit_for_path`
+returns on the first `startswith` match — verified directly against the
+real middleware class for both prefixes plus a pre-existing route, to
+confirm the ordering actually resolves as intended rather than assuming it
+from reading the code.
+
+### Retry/backoff on broker calls
+
+`OandaClient`/`MetaApiClient` previously had no retry at all — one failed
+request = one failed call. Reused the existing retry primitives from
+`src/services/oauth/http_client.py` (`calculate_backoff_delay`,
+`RETRYABLE_STATUS_CODES` — same utilities OAuth provider clients already
+use) rather than adding a second retry implementation.
+
+**Safety-critical asymmetry, deliberate**: `OandaClient._get` (always GET,
+always idempotent) retries fully on timeout/connection failure/429/5xx.
+`MetaApiClient._request` retries **GET only** — `create_order`/
+`modify_order`/`cancel_order` and account provisioning are POST/DELETE,
+and a timeout there doesn't tell us whether MetaApi already placed the
+order; blanket-retrying could double-execute a trade. This isn't a
+generic idempotency-key situation MetaApi's REST API is known to support,
+so the conservative choice is no automatic retry for any state-changing
+MetaApi call — callers (`execution_service.py`) already fail closed on a
+`BrokerTimeoutError`/`BrokerRequestError` from these paths, which is
+correct: an ambiguous execution outcome must surface as a failure requiring
+human/operational follow-up, never a silent retry.
+
+### Observability
+
+`ActivityLog` (`ActivityType.TRADING`) already covered the full proposal
+lifecycle from Phase 5 (`proposal_created`, `approval_requested`,
+`approved`, `rejected`, `execution_started`, `execution_succeeded`,
+`execution_failed`) — confirmed this is genuinely the platform's only
+event/audit mechanism (no separate metrics-only event bus exists anywhere
+in `services/`), so no new infra was needed there. One real gap found:
+account-linking (§16/§17, Phase 6) — a security-relevant event, since it
+grants a channel identity approval authority — wasn't logged anywhere.
+Added `ActivityLog.log_activity(action="trading.channel_linked", ...)` to
+both `TelegramPollingService.handle_link_command` and
+`WhatsAppWebhookService._handle_link_command`'s success paths.
+
+### Deployment: closed a real "how does this ever work in production" gap
+
+Audited every code path that reads a `PlatformBrokerCredential` row
+(`broker_credential_service.py`) against everything that could plausibly
+create one, and found **nothing does** — no controller endpoint, no seed
+script, nothing. Every other platform-owned secret in this codebase
+(SMTP, Stripe, OAuth apps) has a `seed_platform_config.py`-style script;
+this one didn't, meaning a fresh deployment following only what existed
+before this phase would have market data and execution permanently
+broken with a "No active platform OANDA credential configured" error and
+no way to fix it short of a manual DB insert.
+
+Added `api/seed_platform_broker_credentials.py`, matching the existing
+`seed_trading_agent.py`'s async/argparse style exactly: reads
+`OANDA_TOKEN`/`OANDA_ACCOUNT_ID`/`OANDA_ENVIRONMENT`/`METAAPI_TOKEN` from
+the environment, creates or (`--update`) overwrites the corresponding
+`PlatformBrokerCredential` rows, Fernet-encrypting the token through the
+model's existing `.token` property (same pattern as every other encrypted
+credential in this codebase — no new encryption code). Added a
+`# Trading (MetaApi / OANDA)` block to `api/.env.example` in the same
+style as every other integration section, explicitly noting these vars
+aren't read directly at runtime — the seed script is the one write path,
+consistent with how the rest of the platform's secrets work.
+
+### Verification depth
+
+- **Retry logic** — 5/5 cases against a real `httpx.MockTransport` (no
+  network, real request/response cycle through the actual client code):
+  OANDA retries on 503 then succeeds (3 attempts); OANDA exhausts retries
+  on persistent 503 then raises `BrokerRequestError` (4 attempts, matching
+  `_MAX_RETRIES + 1`); OANDA does not retry a 401 (1 attempt, fails fast);
+  MetaApi retries a GET on 502 then succeeds (2 attempts); **MetaApi never
+  retries a POST, even on a retryable 503 status (1 attempt only)** — this
+  last case is the one that actually matters and was verified explicitly,
+  not just asserted in a docstring.
+- **Rate-limit path resolution** — 5/5 cases against the real
+  `RateLimitMiddleware._get_limit_for_path`, confirming both new trading
+  prefixes and one pre-existing prefix all resolve to the intended limits.
+- **`seed_platform_broker_credentials.py`** — 6/6 cases against real
+  Postgres with real Fernet encryption (`ENCRYPTION_KEY`-driven, same
+  infra as every other credential in the platform): no tokens in
+  environment → nothing created; OANDA token → row created, `_token_enc`
+  genuinely encrypted at rest (plaintext token confirmed absent from the
+  stored value), decrypts back correctly through `.token`; re-run without
+  `--update` leaves the existing row untouched and reports it as skipped;
+  re-run with `--update` overwrites it; MetaApi token seeds independently
+  with its own default `environment='production'`.
+- **`trading.channel_linked` ActivityLog entries** — verified the exact
+  `log_activity(...)` call added to both channel-link success paths
+  inserts correctly against a real `activity_logs` table (enum binding,
+  FK columns, hash-chain-compatible nullable `entry_hash`).
+- Full regression pass: every `.py` file touched across all 8 phases
+  (45 files) — `py_compile` clean on all of them; `ruff check` finding
+  count compared file-by-file against each file's last-committed baseline
+  (not just "found N errors" in isolation, since e.g. `models/__init__.py`
+  checked outside its package context reports spurious unused-import
+  findings) — zero new findings introduced anywhere, all pre-existing
+  findings left exactly as they were; `ruff format --check` clean on
+  every file this phase touched.
+
+### What's still explicitly NOT done (honest scope boundary)
+
+- No load/soak testing of the Redis sliding-window limiter under real
+  concurrent trading-agent traffic — the limits chosen are reasoned
+  defaults (matching the platform's existing tiers for comparable
+  endpoints), not empirically tuned.
+- No Langfuse/LLM-tracing-specific instrumentation was added for trading
+  tool calls beyond what `ActivityLog` already captures — the existing
+  `LangfuseService` covers LLM-call tracing platform-wide already and
+  trading tool calls flow through the same `ADKToolRegistry.execute_tool`
+  path as every other tool, so they're already covered by whatever the
+  platform does generically; no trading-specific gap was found there.
+- `seed_platform_broker_credentials.py` was verified against a real
+  Postgres row round-trip, but **not** against a real OANDA/MetaApi
+  account — running the actual market-data/execution flow end-to-end
+  against live (or demo) broker accounts, per every earlier phase's
+  standing recommendation, is still the one thing this sandbox cannot do
+  and should happen before this ships.
+
+---
+
+## Overall summary — all 8 phases complete
+
+All 8 phases of the approved plan are done: 6 phases of feature work
+(foundation, read-only tools, the Trading Agent, web charts,
+approval-gated execution, Telegram/WhatsApp approval) plus one
+investigation phase (MCP Apps, deliberately deferred with documented
+rationale rather than built on unverifiable assumptions) and one hardening
+pass. Every phase followed the same discipline: implement, verify as
+deeply as the sandbox allows (real local Postgres/Redis wherever state or
+SQL correctness was at stake, isolated logic tests otherwise, never just
+"it looks right"), document honestly — including bugs found in this
+session's own new code and, twice, in pre-existing platform code — commit,
+push. Three significant pre-existing-platform findings were surfaced along
+the way and are called out in their respective phase sections above rather
+than buried: the `ApprovalStatus`/`Enum` binding bug affecting the core
+HITL path (Phase 5), the WhatsApp device-link notification gap (Phase 6),
+and the missing platform-broker-credential seeding path (Phase 8).
+
+**Before this ships**, the recurring "not done in this sandbox" items across
+every phase converge on one recommendation: a real end-to-end run against
+live/demo OANDA and MetaApi accounts — link a demo MetaApi account, get a
+quote, get a recommendation, propose a trade, approve it from the web
+dashboard, from Telegram, and from WhatsApp separately, confirm exactly
+one execution lands each time, and run the full `pytest` suite plus
+`alembic upgrade head` in an environment that isn't missing `xmlsec`/a
+working `cryptography` install. Everything that could be verified without
+those has been.

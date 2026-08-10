@@ -12,6 +12,7 @@ MetaApiClient instead.
 Reference: https://developer.oanda.com/rest-live-v20/introduction/
 """
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -19,6 +20,7 @@ from typing import Any
 
 import httpx
 
+from src.services.oauth.http_client import RETRYABLE_STATUS_CODES, calculate_backoff_delay
 from src.services.trading.brokers.base import (
     BrokerAuthError,
     BrokerRequestError,
@@ -50,6 +52,7 @@ _TIMEFRAME_TO_GRANULARITY = {
 }
 
 _REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+_MAX_RETRIES = 3
 
 
 class OandaClient(MarketDataAdapter):
@@ -71,15 +74,34 @@ class OandaClient(MarketDataAdapter):
         return {"Authorization": f"Bearer {self._token}", "Accept-Datetime-Format": "RFC3339"}
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        # GET is idempotent, so retrying on timeout/connection failure/a retryable status is
+        # always safe here — unlike MetaApiClient._request, which must not blanket-retry POSTs
+        # (order placement) since a timeout doesn't tell us whether the broker already acted on it.
         url = f"{self._base_url}{path}"
-        try:
-            async with httpx.AsyncClient(headers=self._headers(), timeout=_REQUEST_TIMEOUT) as client:
-                resp = await client.get(url, params=params)
-        except httpx.TimeoutException as exc:
-            raise BrokerTimeoutError(f"OANDA request timed out: {path}") from exc
-        except httpx.HTTPError as exc:
-            raise BrokerRequestError(f"OANDA request failed: {exc}") from exc
+        last_exc: Exception | None = None
+        resp: httpx.Response | None = None
 
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(headers=self._headers(), timeout=_REQUEST_TIMEOUT) as client:
+                    resp = await client.get(url, params=params)
+            except httpx.TimeoutException as exc:
+                last_exc = exc
+                if attempt >= _MAX_RETRIES:
+                    raise BrokerTimeoutError(f"OANDA request timed out: {path}") from exc
+            except httpx.HTTPError as exc:
+                raise BrokerRequestError(f"OANDA request failed: {exc}") from exc
+            else:
+                if resp.status_code not in RETRYABLE_STATUS_CODES or attempt >= _MAX_RETRIES:
+                    break
+                last_exc = None
+
+            delay = calculate_backoff_delay(attempt)
+            logger.info(f"Retrying OANDA GET {path} in {delay:.2f}s (attempt {attempt + 1}/{_MAX_RETRIES})")
+            await asyncio.sleep(delay)
+
+        if resp is None:
+            raise BrokerTimeoutError(f"OANDA request timed out: {path}") from last_exc
         if resp.status_code == 401:
             raise BrokerAuthError("OANDA rejected the platform credential (401)")
         if resp.status_code >= 400:

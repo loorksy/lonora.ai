@@ -35,6 +35,7 @@ account before relying on them in production, since this session had no
 live network access to MetaApi's docs host to double-check byte-for-byte.
 """
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -42,6 +43,7 @@ from typing import Any
 
 import httpx
 
+from src.services.oauth.http_client import RETRYABLE_STATUS_CODES, calculate_backoff_delay
 from src.services.trading.brokers.base import (
     AccountInformation,
     BrokerAuthError,
@@ -83,6 +85,7 @@ _ACTION_TYPE_LIMIT = {OrderSide.BUY: "ORDER_TYPE_BUY_LIMIT", OrderSide.SELL: "OR
 _ACTION_TYPE_STOP = {OrderSide.BUY: "ORDER_TYPE_BUY_STOP", OrderSide.SELL: "ORDER_TYPE_SELL_STOP"}
 
 _REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+_MAX_RETRIES = 3
 
 
 class MetaApiClient(ExecutionBrokerAdapter):
@@ -100,14 +103,45 @@ class MetaApiClient(ExecutionBrokerAdapter):
         return {"auth-token": self._token, "Content-Type": "application/json", "Accept": "application/json"}
 
     async def _request(self, method: str, base_url: str, path: str, **kwargs: Any) -> Any:
+        # Only GET is safe to blanket-retry: it's idempotent, so a retry after a timeout can never
+        # cause a duplicate side effect. POST/PUT/DELETE here include order placement/modification/
+        # cancellation (create_order etc.) — a timeout doesn't tell us whether MetaApi already acted
+        # on the request, so retrying could place a duplicate order. Those keep the original
+        # fail-fast (no retry) behavior; execution_service.py's proposal-level idempotency (CAS +
+        # unique index + Redis token) guards against duplicate *approval*, not a retried broker call.
         url = f"{base_url}{path}"
-        try:
-            async with httpx.AsyncClient(headers=self._headers(), timeout=_REQUEST_TIMEOUT) as client:
-                resp = await client.request(method, url, **kwargs)
-        except httpx.TimeoutException as exc:
-            raise BrokerTimeoutError(f"MetaApi request timed out: {method} {path}") from exc
-        except httpx.HTTPError as exc:
-            raise BrokerRequestError(f"MetaApi request failed: {exc}") from exc
+        if method != "GET":
+            try:
+                async with httpx.AsyncClient(headers=self._headers(), timeout=_REQUEST_TIMEOUT) as client:
+                    resp = await client.request(method, url, **kwargs)
+            except httpx.TimeoutException as exc:
+                raise BrokerTimeoutError(f"MetaApi request timed out: {method} {path}") from exc
+            except httpx.HTTPError as exc:
+                raise BrokerRequestError(f"MetaApi request failed: {exc}") from exc
+        else:
+            last_exc: Exception | None = None
+            resp = None
+            for attempt in range(_MAX_RETRIES + 1):
+                try:
+                    async with httpx.AsyncClient(headers=self._headers(), timeout=_REQUEST_TIMEOUT) as client:
+                        resp = await client.request(method, url, **kwargs)
+                except httpx.TimeoutException as exc:
+                    last_exc = exc
+                    if attempt >= _MAX_RETRIES:
+                        raise BrokerTimeoutError(f"MetaApi request timed out: {method} {path}") from exc
+                except httpx.HTTPError as exc:
+                    raise BrokerRequestError(f"MetaApi request failed: {exc}") from exc
+                else:
+                    if resp.status_code not in RETRYABLE_STATUS_CODES or attempt >= _MAX_RETRIES:
+                        break
+                    last_exc = None
+
+                delay = calculate_backoff_delay(attempt)
+                logger.info(f"Retrying MetaApi GET {path} in {delay:.2f}s (attempt {attempt + 1}/{_MAX_RETRIES})")
+                await asyncio.sleep(delay)
+
+            if resp is None:
+                raise BrokerTimeoutError(f"MetaApi request timed out: {method} {path}") from last_exc
 
         if resp.status_code == 401:
             raise BrokerAuthError("MetaApi rejected the platform credential (401)")

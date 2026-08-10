@@ -64,6 +64,14 @@ class RateLimitMiddleware:
         "/api/v1/data-analysis/query-data-source": {"requests": 15, "window": 60},
         "/api/v1/database-connections": {"requests": 20, "window": 60},
         "/api/v1/custom-tools": {"requests": 20, "window": 60},
+        # Trading — channel-link codes are a potential enumeration/abuse surface if hit
+        # repeatedly (each call mints a fresh one-time code), so they get a tight limit; the
+        # rest of the trading API (quotes/proposals/approve/reject) is authenticated,
+        # tenant-scoped, human-paced activity, so a moderate general limit is enough. Order
+        # matters here — more specific prefixes must be listed before the general one, since
+        # RateLimitMiddleware._get_limit_for_path returns on the first matching prefix.
+        "/api/v1/trading/channel-link/generate": {"requests": 5, "window": 60},
+        "/api/v1/trading/": {"requests": 30, "window": 60},
         # Public webhook endpoints - moderate
         "/webhook/": {"requests": 100, "window": 60},
         # Health check - very permissive
