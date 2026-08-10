@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synkora-celery-worker
+  namespace: synkora-production
+  labels:
+    app: synkora
+    component: celery-worker
+    version: v1
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: synkora
+      component: celery-worker
+  template:
+    metadata:
+      labels:
+        app: synkora
+        component: celery-worker
+        version: v1
+    spec:
+      imagePullSecrets:
+      - name: ecr-registry-secret
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: celery-worker
+        image: IMAGE_PLACEHOLDER
+        imagePullPolicy: Always
+        command: ["celery"]
+        # Handles only the "default" queue (general-purpose tasks).
+        # Agent tasks → celery-worker-agents-deployment.yml (memory-intensive, long-running)
+        # Email/notification tasks → celery-worker-notifications-deployment.yml (I/O-bound, short)
+        args: ["-A", "src.celery_app", "worker", "--loglevel=info", "-Q", "default"]
+        envFrom:
+        - configMapRef:
+            name: synkora-config
+        - secretRef:
+            name: synkora-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "100m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 20Gi
+      # Document/data-source/workspace tasks can take several minutes.
+      # 120s gives enough headroom for graceful task completion before SIGKILL.
+      terminationGracePeriodSeconds: 120

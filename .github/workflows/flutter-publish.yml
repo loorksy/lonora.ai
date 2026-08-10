@@ -1,0 +1,85 @@
+name: Flutter Package — Test & Publish
+
+on:
+  # Auto-publish on version tags: git tag flutter/v1.0.0 && git push --tags
+  push:
+    tags:
+      - "flutter/v*"
+  # Manual trigger with optional dry-run
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (validate but skip pub.dev publish)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+concurrency:
+  group: flutter-publish
+  cancel-in-progress: false
+
+jobs:
+  test-and-publish:
+    name: Test & Publish Flutter Package
+    runs-on: ubuntu-latest
+
+    # Required for pub.dev OIDC publishing — no credentials stored anywhere
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2  # v2
+        with:
+          flutter-version: "3.41.x"
+          channel: stable
+          cache: true
+
+      - name: Sync version from tag
+        if: startsWith(github.ref, 'refs/tags/flutter/v')
+        working-directory: flutter/synkora_chat
+        run: |
+          VERSION=${GITHUB_REF_NAME#flutter/v}
+          echo "Publishing version: $VERSION"
+          sed -i "s/^version:.*/version: $VERSION/" pubspec.yaml
+
+      - name: Install dependencies
+        working-directory: flutter/synkora_chat
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: flutter/synkora_chat
+        run: flutter analyze --fatal-infos
+
+      - name: Run tests
+        working-directory: flutter/synkora_chat
+        run: flutter test
+
+      # ── pub.dev publish via OIDC ─────────────────────────────────────────
+      # No credentials or secrets needed — GitHub's OIDC token is used.
+      #
+      # One-time setup on pub.dev:
+      #   1. Publish the package manually once: dart pub publish
+      #   2. Go to pub.dev → your package → Admin → Automated publishing
+      #   3. Enable GitHub Actions publishing
+      #   4. Set repository: <your-org>/<your-repo>
+      #   5. Set tag pattern: flutter/v{{version}}
+      #   6. Save — done, no secrets needed ever
+      - name: Publish to pub.dev
+        if: ${{ startsWith(github.ref, 'refs/tags/flutter/v') || inputs.dry_run == 'false' }}
+        working-directory: flutter/synkora_chat
+        run: dart pub publish --force
+
+      - name: Summary
+        run: |
+          echo "## Flutter Package Build" >> $GITHUB_STEP_SUMMARY
+          echo "- **Package:** synkora_chat" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ startsWith(github.ref, 'refs/tags/flutter/v') }}" == "true" || "${{ inputs.dry_run }}" == "false" ]]; then
+            echo "- **Published:** yes" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Published:** no (dry run)" >> $GITHUB_STEP_SUMMARY
+          fi

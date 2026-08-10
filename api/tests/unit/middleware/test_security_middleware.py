@@ -1,0 +1,221 @@
+"""Tests for security_middleware.py.
+
+These tests verify the security middleware functionality including:
+- Security headers
+- Rate limiting
+- Input sanitization
+"""
+
+import re
+from unittest.mock import Mock
+
+
+class TestInputSanitizationMiddleware:
+    """Tests for InputSanitizationMiddleware."""
+
+    def test_contains_xss_script_detection(self):
+        """Test that partial script tags are detected as XSS."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        # Script tag without closing should be detected
+        assert middleware._contains_xss('<script type="text/javascript">') is True
+        # Full script tag should also be detected
+        assert middleware._contains_xss("<script>alert(1)</script>") is True
+
+
+class TestInputSanitizationMiddlewareLogic:
+    """Tests for InputSanitizationMiddleware logic methods."""
+
+    def test_contains_xss_script_tag(self):
+        """Test _contains_xss detects script tags."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        assert middleware._contains_xss("<script>alert(1)</script>") is True
+        assert middleware._contains_xss("<SCRIPT>alert(1)</SCRIPT>") is True
+        assert middleware._contains_xss('<script type="text/javascript">code</script>') is True
+
+    def test_contains_xss_javascript_protocol(self):
+        """Test _contains_xss detects javascript: protocol."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        assert middleware._contains_xss('href="javascript:alert(1)"') is True
+        assert middleware._contains_xss("JavaScript:void(0)") is True
+        assert middleware._contains_xss('src="javascript:evil()"') is True
+
+    def test_contains_xss_event_handlers(self):
+        """Test _contains_xss detects event handlers."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        assert middleware._contains_xss('onerror="alert(1)"') is True
+        assert middleware._contains_xss('onclick = "evil()"') is True
+        assert middleware._contains_xss('onload="hack()"') is True
+        assert middleware._contains_xss('onmouseover="bad()"') is True
+
+    def test_contains_xss_iframe(self):
+        """Test _contains_xss detects iframe tags."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        assert middleware._contains_xss('<iframe src="evil.com"></iframe>') is True
+        assert middleware._contains_xss("<IFRAME>content</IFRAME>") is True
+
+    def test_contains_xss_object_embed(self):
+        """Test _contains_xss detects object and embed tags."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        assert middleware._contains_xss('<object data="malware.swf"></object>') is True
+        assert middleware._contains_xss('<embed src="malware.swf">') is True
+
+    def test_contains_xss_link_meta(self):
+        """Test _contains_xss behavior for link and meta tags.
+
+        Bare <link> and <meta> tags are intentionally NOT blocked — they cause
+        false positives when users paste HTML snippets or AI responses contain
+        HTML examples. Dangerous variants (javascript: URIs, event handlers)
+        are caught by the URI-scheme and on*= patterns already in the list.
+        """
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        # Safe bare tags — intentionally allowed
+        assert middleware._contains_xss('<link rel="stylesheet" href="styles.css">') is False
+        assert middleware._contains_xss('<meta http-equiv="refresh">') is False
+
+        # Dangerous variants — caught by existing URI-scheme / event-handler patterns
+        assert middleware._contains_xss('<link href="javascript:alert(1)">') is True
+        assert middleware._contains_xss('<meta content="0;url=javascript:alert(1)">') is True
+        assert middleware._contains_xss('<link onload="alert(1)">') is True
+
+    def test_contains_xss_clean_content(self):
+        """Test _contains_xss allows clean content."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        assert middleware._contains_xss("Hello world") is False
+        assert middleware._contains_xss('{"key": "value"}') is False
+        assert middleware._contains_xss("Normal <b>bold</b> text") is False
+        assert middleware._contains_xss("<p>Paragraph</p>") is False
+
+    def test_get_client_ip_from_forwarded_for(self):
+        """Test get_client_ip extracts from X-Forwarded-For via trusted proxy."""
+        from src.utils.ip_utils import get_client_ip
+
+        # Direct connection from trusted proxy; X-Forwarded-For carries the real client.
+        ip = get_client_ip("127.0.0.1", "203.0.113.4, 10.0.0.1", None)
+        assert ip == "203.0.113.4"
+
+    def test_get_client_ip_from_real_ip(self):
+        """Test get_client_ip extracts from X-Real-IP via trusted proxy."""
+        from src.utils.ip_utils import get_client_ip
+
+        ip = get_client_ip("10.0.0.1", None, "203.0.113.40")
+        assert ip == "203.0.113.40"
+
+
+class TestExtractScannableStrings:
+    """Tests for InputSanitizationMiddleware._extract_scannable_strings."""
+
+    def setup_method(self):
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        self.middleware = InputSanitizationMiddleware(Mock())
+
+    def test_extracts_top_level_strings(self):
+        """Only top-level string values are returned from a JSON object."""
+        import json
+
+        body = json.dumps({"message": "hello world", "agent_name": "MyAgent"})
+        result = self.middleware._extract_scannable_strings(body)
+        assert set(result) == {"hello world", "MyAgent"}
+
+    def test_skips_nested_lists(self):
+        """conversation_history (a list) is not included in scannable strings."""
+        import json
+
+        body = json.dumps(
+            {
+                "message": "new user message",
+                "conversation_history": [{"role": "assistant", "content": "<script>alert(1)</script>"}],
+            }
+        )
+        result = self.middleware._extract_scannable_strings(body)
+        # Only the top-level "message" string is returned; history is a list and skipped.
+        assert result == ["new user message"]
+        # The XSS in history must NOT be flagged.
+        assert not any(self.middleware._contains_xss(s) for s in result)
+
+    def test_skips_nested_dicts(self):
+        """Nested dict values are not included in scannable strings."""
+        import json
+
+        body = json.dumps({"message": "hi", "metadata": {"key": "<script>x</script>"}})
+        result = self.middleware._extract_scannable_strings(body)
+        assert result == ["hi"]
+
+    def test_skips_non_string_scalars(self):
+        """Integers, booleans, and None at top level are not included."""
+        import json
+
+        body = json.dumps({"message": "hi", "count": 5, "flag": True, "optional": None})
+        result = self.middleware._extract_scannable_strings(body)
+        assert result == ["hi"]
+
+    def test_fallback_for_invalid_json(self):
+        """Non-JSON body falls back to returning the raw string."""
+        result = self.middleware._extract_scannable_strings("not json at all")
+        assert result == ["not json at all"]
+
+    def test_real_xss_in_message_field_still_detected(self):
+        """XSS in the actual message field is still caught after the change."""
+        import json
+
+        body = json.dumps({"message": "<script>alert(1)</script>", "agent_name": "Bot"})
+        strings = self.middleware._extract_scannable_strings(body)
+        assert any(self.middleware._contains_xss(s) for s in strings)
+
+
+class TestMiddlewareConstants:
+    """Tests for middleware class constants and configurations."""
+
+    def test_xss_patterns_exist(self):
+        """Test XSS patterns are defined."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        assert hasattr(middleware, "XSS_PATTERNS")
+        assert len(middleware.XSS_PATTERNS) > 0
+
+    def test_xss_patterns_are_valid_regex(self):
+        """Test XSS pattern strings are valid and the combined regex compiles."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+
+        for pattern in middleware.XSS_PATTERNS:
+            compiled = re.compile(pattern, re.IGNORECASE)
+            assert compiled is not None
+
+        # Combined compiled regex must exist and be a Pattern object
+        assert isinstance(middleware._XSS_RE, re.Pattern)
+
+    def test_scan_limit_is_set(self):
+        """Test that the scan limit constant is defined."""
+        from src.middleware.security_middleware import InputSanitizationMiddleware
+
+        middleware = InputSanitizationMiddleware(Mock())
+        assert isinstance(middleware._SCAN_LIMIT, int)
+        assert middleware._SCAN_LIMIT > 0
