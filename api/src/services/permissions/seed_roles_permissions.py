@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Define all resources in the system
 RESOURCES = [
     "agents",
+    "trading",
     "knowledge_bases",
     "data_sources",
     "mcp_servers",
@@ -194,6 +195,49 @@ async def create_roles(db: AsyncSession, permissions: dict[str, Permission]) -> 
     return roles
 
 
+async def create_trading_approve_permission(db: AsyncSession, roles: dict[str, "Role"]) -> None:
+    """
+    Seed the distinct 'trading.approve' permission (§9.5 of the trading domain spec).
+
+    Deliberately NOT part of the standard create/read/update/delete/manage action
+    set on the 'trading' resource — ordinary chat/agent access to a trading agent
+    must never imply the authority to approve a real-money proposal. Granted only
+    to platform_owner/owner/admin by default; a tenant admin can extend it to other
+    members via the existing custom_permissions override, independent of any other
+    grant.
+    """
+    result = await db.execute(
+        select(Permission).filter(Permission.resource == "trading", Permission.action == "approve")
+    )
+    permission = result.scalar_one_or_none()
+    if not permission:
+        permission = Permission(
+            id=str(uuid.uuid4()),
+            name="trading.approve",
+            resource="trading",
+            action="approve",
+            description="Approve or reject pending trade proposals (distinct from ordinary trading agent chat access)",
+        )
+        db.add(permission)
+        await db.flush()
+        logger.debug("Created permission: trading:approve")
+
+    for role_key in ("platform_owner", "owner", "admin"):
+        role = roles.get(role_key)
+        if not role:
+            continue
+        result = await db.execute(
+            select(RolePermission).filter(
+                RolePermission.role_id == role.id, RolePermission.permission_id == permission.id
+            )
+        )
+        if not result.scalar_one_or_none():
+            db.add(RolePermission(id=str(uuid.uuid4()), role_id=role.id, permission_id=permission.id))
+            logger.debug(f"  Assigned permission: trading:approve to {role.name}")
+
+    await db.commit()
+
+
 async def seed_roles_and_permissions(db: AsyncSession):
     """Main function to seed roles and permissions."""
     logger.info("Starting roles and permissions seeding...")
@@ -208,6 +252,10 @@ async def seed_roles_and_permissions(db: AsyncSession):
         logger.info("2. Creating roles and assigning permissions...")
         roles = await create_roles(db, permissions)
         logger.info(f"Total roles: {len(roles)}")
+
+        # Seed the distinct trading:approve permission (not part of standard CRUD actions)
+        logger.info("3. Seeding trading:approve permission...")
+        await create_trading_approve_permission(db, roles)
 
         logger.info("Roles and permissions seeded successfully!")
 

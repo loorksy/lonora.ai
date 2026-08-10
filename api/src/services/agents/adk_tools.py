@@ -501,6 +501,13 @@ class ADKToolRegistry:
 
         register_trading_tools(self)
 
+        # Trading execution tools (propose_* — approval-gated, never execute directly)
+        from src.services.agents.tool_registrations.trading_execution_tools_registry import (
+            register_trading_execution_tools,
+        )
+
+        register_trading_execution_tools(self)
+
         # Multi-agent transfer tool
         self.register_tool(
             name="transfer_to_agent",

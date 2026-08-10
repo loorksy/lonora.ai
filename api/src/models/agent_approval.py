@@ -45,7 +45,11 @@ class AgentApprovalRequest(Base):
     tool_args_hash = Column(String(64), nullable=False)  # sha256(json(sorted tool_args))
 
     status = Column(
-        Enum(ApprovalStatus, name="approval_status_enum"),
+        # values_callable is required: SQLAlchemy's default Enum binding sends the Python
+        # member NAME ("PENDING") rather than its lowercase .value ("pending"), which does
+        # not exist in the Postgres enum type created by the migration — without this, every
+        # insert/update through the ORM raises "invalid input value for enum approval_status_enum".
+        Enum(ApprovalStatus, name="approval_status_enum", values_callable=lambda enum_cls: [e.value for e in enum_cls]),
         nullable=False,
         default=ApprovalStatus.PENDING,
     )

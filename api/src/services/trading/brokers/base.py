@@ -88,6 +88,8 @@ class SymbolInfo:
     volume_min: Decimal | None = None
     volume_max: Decimal | None = None
     volume_step: Decimal | None = None
+    # Units per 1.0 volume — required to convert price deltas to account-currency risk.
+    contract_size: Decimal | None = None
     tradeable: bool = True
     raw: dict[str, Any] = field(default_factory=dict)
 

@@ -147,7 +147,7 @@ def upgrade() -> None:
             sa.Column("symbol", sa.String(50), nullable=False),
             sa.Column("action", sa.String(20), nullable=False),
             sa.Column("order_type", sa.String(20), nullable=False, server_default="market"),
-            sa.Column("volume", sa.Numeric(15, 2), nullable=False),
+            sa.Column("volume", sa.Numeric(15, 2), nullable=True),
             sa.Column("volume_source", sa.String(20), nullable=False),
             sa.Column("stop_loss", sa.Numeric(20, 5), nullable=True),
             sa.Column("take_profit", sa.Numeric(20, 5), nullable=True),

@@ -72,7 +72,10 @@ class TradeProposal(BaseModel, TenantMixin):
         expires_at: Proposal must be approved before this or it expires
         approved_at / approved_by: Who approved it (must hold trading:approve)
         execution_started_at / execution_completed_at: Execution timing
-        broker_order_id: MetaApi order/position id once executed
+        broker_order_id: dual-purpose — for action in (close, modify, cancel) this is the
+            EXISTING MetaApi position/order id being acted on, set at proposal creation; for
+            action in (buy, sell) it is null until execution, then set to the newly-created
+            MetaApi order/position id. A proposal is never both, so this never conflicts.
         failure_reason: Human-readable reason if status == FAILED/REJECTED
     """
 
@@ -88,7 +91,14 @@ class TradeProposal(BaseModel, TenantMixin):
     )
 
     status = Column(
-        SQLEnum(TradeProposalStatus, name="trade_proposal_status_enum"),
+        # values_callable required — see the identical comment on AgentApprovalRequest.status
+        # (agent_approval.py) for why: SQLAlchemy's default Enum binding uses the member NAME,
+        # not its lowercase .value, which the Postgres enum type doesn't contain.
+        SQLEnum(
+            TradeProposalStatus,
+            name="trade_proposal_status_enum",
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
+        ),
         nullable=False,
         default=TradeProposalStatus.PROPOSED,
         index=True,
@@ -99,8 +109,9 @@ class TradeProposal(BaseModel, TenantMixin):
     action = Column(String(20), nullable=False, comment="buy | sell | close | modify | cancel")
     order_type = Column(String(20), nullable=False, default="market", comment="market | limit | stop")
 
-    volume = Column(Numeric(15, 2), nullable=False)
-    volume_source = Column(String(20), nullable=False, comment="explicit | risk_derived")
+    # Nullable: not meaningful for modify/cancel actions (they don't change position size).
+    volume = Column(Numeric(15, 2), nullable=True)
+    volume_source = Column(String(20), nullable=False, comment="explicit | risk_derived | n/a")
 
     stop_loss = Column(Numeric(20, 5), nullable=True)
     take_profit = Column(Numeric(20, 5), nullable=True)

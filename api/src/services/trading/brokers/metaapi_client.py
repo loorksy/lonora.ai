@@ -210,6 +210,7 @@ class MetaApiClient(ExecutionBrokerAdapter):
             volume_min=Decimal(str(data["minVolume"])) if "minVolume" in data else None,
             volume_max=Decimal(str(data["maxVolume"])) if "maxVolume" in data else None,
             volume_step=Decimal(str(data["volumeStep"])) if "volumeStep" in data else None,
+            contract_size=Decimal(str(data["contractSize"])) if "contractSize" in data else None,
             tradeable=data.get("tradeMode", 1) != 0,
             raw=data,
         )

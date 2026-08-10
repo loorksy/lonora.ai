@@ -241,6 +241,13 @@ ROUTER_REGISTRY: list[RouteConfig] = [
         prefix="/api/a2a",
         tags=["A2A"],
     ),
+    # ===== Trading domain =====
+    RouteConfig(
+        module="src.controllers.trading",
+        attribute="router",
+        prefix="",
+        tags=["trading"],
+    ),
     # ===== MCP & Tools =====
     RouteConfig(
         module="src.controllers.mcp_servers",

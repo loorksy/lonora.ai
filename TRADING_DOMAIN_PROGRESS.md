@@ -47,7 +47,7 @@ full `pytest` suite and `alembic upgrade head` in a real dev/CI environment**
 | 2. Read-only trading tools | ✅ Done | Commit pending (see below) |
 | 3. Trading Agent (config, system prompt, tool allow-list) | ✅ Done | |
 | 4. Trading charts (klinecharts, web) | ✅ Done | |
-| 5. Approval-gated proposals (risk engine, position sizing, RBAC, execution) | ⬜ Not started | |
+| 5. Approval-gated proposals (risk engine, position sizing, RBAC, execution) | ✅ Done | See below — includes a pre-existing platform bug fix |
 | 6. Telegram + WhatsApp (buttons, chart images) | ⬜ Not started | |
 | 7. MCP Apps / ext-apps investigation | ⬜ Not started | |
 | 8. Production hardening (observability, docs, rate limiting) | ⬜ Not started | |
@@ -239,5 +239,140 @@ in would need an imperative handle/ref from `KLineChartsRenderer` up to
 `ChartRenderer` — left as a follow-up since it's a cosmetic gap (download
 still produces *a* PNG, just possibly a partial one), not a functional
 break, and this phase's scope was chart rendering, not export tooling.
+
+---
+
+## Phase 5 — Approval-gated proposals ✅
+
+The biggest phase — this is the actual money-safety layer. Summary by
+piece, then the bugs this phase's testing caught (including one **pre-existing
+platform bug**, not introduced by this work, that had to be fixed for the
+new code to function at all).
+
+**risk_engine.py** — pure `validate_trade_request()`: trade_allowed,
+symbol tradeable, stop-loss required for new positions, volume vs
+symbol min/max/step, order-type/limit-price consistency, SL/TP distance +
+correct-side sanity, margin sufficiency, max position size, max risk %,
+max open positions, duplicate-pending check. Volume/SL-TP checks are
+skipped correctly for modify/cancel (not meaningful for those actions) but
+still required for close.
+
+**position_sizing.py** — `compute_volume()`: explicit (validated as given,
+never silently rounded) or risk_derived (computed from equity × risk% ÷
+(SL distance × contract_size), always rounded DOWN to the volume step,
+never up). Both paths validated against the symbol's own volume_min/max/step
+before a proposal is allowed to exist (§11.1).
+
+**proposal_service.py** — `create_proposal()`: resolves + ownership-checks
+the TradingAccount, loads RiskConfiguration, fetches fresh MetaApi
+account/symbol/quote/positions data, sizes the order, runs risk_engine,
+and — only if it passes — creates the TradeProposal row and calls the
+existing `HumanApprovalService.create_and_notify()` for notification
+(reusing the platform's HITL notify/expire/Redis-idempotency machinery,
+not duplicating it). A request that fails validation never becomes a
+stored proposal.
+
+**execution_service.py** — `approve_proposal()`/`reject_proposal()`/
+`execute_proposal()`: deliberately NOT wired through the platform's generic
+`HumanApprovalService.handle_reply()` (which re-fires the *agent run*,
+wrong model for a financial order needing fresh MetaApi revalidation).
+Every approval/rejection requires `trading:approve` (checked via the real
+`PermissionService`, same one the rest of the platform uses). Duplicate
+execution is prevented two ways: an application-level compare-and-swap
+`UPDATE ... WHERE status = expected` (only one concurrent caller ever gets
+`rowcount == 1`) and the DB's own partial unique index from Phase 1.
+Execution re-fetches account/symbol/quote fresh from MetaApi, rejects if
+price moved >0.5% from the proposal-time price ("conditions changed
+materially, propose again"), re-runs risk_engine against the fresh data,
+then places the order and records a TradeExecution row.
+
+**RBAC** — `trading.approve` added to `seed_roles_permissions.py` as a
+**distinct** permission (§9.5), deliberately outside the standard
+create/read/update/delete/manage action set so it's never bundled into
+ordinary "trading" resource access — granted by default only to
+platform_owner/owner/admin roles, extendable per-tenant via the existing
+`custom_permissions` override.
+
+**Tools** (`internal_tools/trading_execution_tools.py` +
+`tool_registrations/trading_execution_tools_registry.py`): `propose_market_order`,
+`propose_limit_order`, `propose_stop_order`, `propose_close_position`,
+`propose_modify_position`, `propose_cancel_order`, `get_pending_proposals`
+— all tagged `tool_category="action"`. None of them can execute anything;
+they only ever produce a PENDING_APPROVAL proposal.
+
+**API** (`controllers/trading.py`, mounted via `router_registry.py`):
+account linking/listing/unlinking, positions/orders/history, market
+quote/candles, proposal listing/detail/approve/reject. Same
+`{"success": ..., "data"/"error": ...}` shape and
+`Depends(get_current_tenant_id)`/`Depends(get_current_account)` convention
+as the rest of the platform.
+
+### Bugs found and fixed by this phase's testing
+
+1. **Risk-% formula ignored FX contract size** (risk_engine.py) — the
+   original formula computed `price_diff × volume` as the dollar risk,
+   which is only correct if 1.0 volume = 1 unit. For real FX lots (1.0 =
+   100,000 units), this **understated risk by 5 orders of magnitude**.
+   Fixed by adding `SymbolInfo.contract_size` (populated from MetaApi's
+   `contractSize` field) and multiplying it into the formula; falls back
+   to a loud warning (not silent) when contract size is unavailable.
+   Caught by a functional test that used a realistic contract size and
+   got a materially different (correct) answer than the naive formula.
+2. **Explicit volumes were silently rounded instead of validated**
+   (position_sizing.py) — `_snap_to_step()` was applied unconditionally to
+   both explicit and risk-derived volumes. An explicit volume the
+   user/agent asked for (e.g. 0.015 lots) would silently become 0.01
+   instead of being rejected — changing what was actually ordered without
+   telling anyone. Fixed: explicit volumes are now validated as given and
+   rejected with a clear reason if misaligned; only risk-derived volumes
+   are rounded (always down).
+3. **Pre-existing platform bug: `Enum(SomeStrEnum, name=...)` without
+   `values_callable` sends the Python member NAME to Postgres, not its
+   `.value`** — SQLAlchemy 2.0's default enum binding uses `.name`
+   ("PENDING") rather than the lowercase `.value` ("pending") the
+   migration-created Postgres enum type actually contains, for any
+   `enum.StrEnum` whose member names and values differ in case (which is
+   every enum in this codebase using the lowercase-value convention).
+   Verified with a real Postgres insert: `INSERT ... VALUES ('PENDING')`
+   against a `('pending', 'approved', ...)` enum type raises
+   `invalid input value for enum`. This affects the **pre-existing**
+   `AgentApprovalRequest.status` column (`agent_approval.py`) — i.e. the
+   platform's core HITL approval-creation path — not just the new
+   `TradeProposal.status` column this phase added. Both were fixed by
+   adding `values_callable=lambda enum_cls: [e.value for e in enum_cls]`
+   to the `Enum(...)` column definition. **This was flagged to the user as
+   a significant pre-existing-code finding, not something introduced by
+   this work** — worth independently confirming in whatever environment
+   actually runs `HumanApprovalService.create_and_notify()` in production,
+   since if this sandbox's finding holds there too, every approval-request
+   creation would currently be failing.
+
+### Verification depth (this phase got the most scrutiny of any phase so far)
+
+- `risk_engine.py` / `position_sizing.py`: pure-function unit tests, ~20
+  scenarios total, including the two bugs above and their fixes,
+  re-verified after each fix.
+- `execution_service.py`: **full integration test against a real local
+  Postgres** — real `PermissionService` (seeded actual `permissions`/
+  `roles`/`role_permissions`/`tenant_account_joins` rows and confirmed
+  both allow and deny paths), real SQLAlchemy models (with the enum fix),
+  a hand-built fake MetaApi client (no live network calls). Confirmed:
+  non-approver blocked, approver succeeds end-to-end through to a real
+  `TradeExecution` row, double-approval blocked (`ProposalStateError`),
+  exactly one `EXECUTED` row exists, and — separately — a materially stale
+  price blocks execution before `create_order` is ever called (asserted by
+  making the fake client's `create_order` raise if reached).
+- The CAS pattern and the partial-unique-index backstop were also each
+  independently proven with raw SQL against the real schema (first UPDATE
+  succeeds, second affects 0 rows; second EXECUTED insert for the same
+  proposal raises a unique-constraint violation).
+- `proposal_service.py`, `trading_execution_tools.py`, `controllers/trading.py`:
+  `py_compile` + `ruff check`/`format` clean; not integration-tested end to
+  end in this sandbox (would need a live or thoroughly mocked MetaApi
+  provisioning flow) — **recommend a real end-to-end proposal-creation
+  test** (chat → propose_market_order → PENDING_APPROVAL → approve →
+  EXECUTED) in a real dev environment before this ships.
+- Migration re-verified with a full up/down/up round-trip after the
+  `volume` nullable change.
 
 ---
