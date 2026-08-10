@@ -127,6 +127,8 @@ class HumanApprovalService:
                 await self._send_whatsapp_business(approval, channel_config)
             elif channel == "whatsapp_web":
                 await self._send_whatsapp_web(approval, channel_config)
+            elif channel == "telegram":
+                notification_ref = await self._send_telegram(approval, channel_config)
             elif channel == "chat":
                 await self._send_chat(approval, channel_config)
             else:
@@ -286,6 +288,10 @@ class HumanApprovalService:
         if channel == "chat":
             conv_id = channel_config.get("conversation_id", "")
             return f"hitl:chat:{agent_id}:{conv_id}"
+        if channel == "telegram":
+            bot_id = channel_config.get("bot_id", "")
+            chat_id = channel_config.get("chat_id", "")
+            return f"hitl:telegram:{bot_id}:{chat_id}"
         return f"hitl:{channel}:{agent_id}"
 
     async def _store_execution_token(self, approval: AgentApprovalRequest) -> None:
@@ -367,7 +373,13 @@ class HumanApprovalService:
         return {"slack_bot_id": str(bot.id), "channel_id": channel_id, "message_ts": message_ts}
 
     async def _send_whatsapp_business(self, approval: AgentApprovalRequest, channel_config: dict) -> None:
-        """Send approval request via WhatsApp Business API."""
+        """Send approval request via WhatsApp Business API.
+
+        Trade proposals (tool_args carries a proposal_id) get interactive Approve/Reject
+        buttons whose reply id is 'trade:<proposal_id>:<approve|reject>', routed straight to
+        execution_service by WhatsAppWebhookService — bypassing this service's generic
+        text-reply flow entirely. Every other action-approval keeps the plain YES/NO text prompt.
+        """
         from src.models.whatsapp_bot import WhatsAppBot
         from src.services.agents.security import decrypt_value
 
@@ -391,22 +403,47 @@ class HumanApprovalService:
         if len(args_preview) > 200:
             args_preview = args_preview[:197] + "..."
 
-        message = (
-            f"Action pending your approval.\n"
-            f"Agent *{approval.agent_name}* wants to call `{approval.tool_name}`:\n"
-            f"{args_preview}\n\n"
-            f"Reply YES to proceed or NO to cancel."
-        )
+        proposal_id = approval.tool_args.get("proposal_id") if isinstance(approval.tool_args, dict) else None
+
+        if proposal_id:
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to_phone,
+                "type": "interactive",
+                "interactive": {
+                    "type": "button",
+                    "body": {
+                        "text": (
+                            f"Action pending your approval.\n"
+                            f"Agent {approval.agent_name} wants to call {approval.tool_name}:\n"
+                            f"{args_preview}"
+                        )
+                    },
+                    "action": {
+                        "buttons": [
+                            {"type": "reply", "reply": {"id": f"trade:{proposal_id}:approve", "title": "Approve"}},
+                            {"type": "reply", "reply": {"id": f"trade:{proposal_id}:reject", "title": "Reject"}},
+                        ]
+                    },
+                },
+            }
+        else:
+            message = (
+                f"Action pending your approval.\n"
+                f"Agent *{approval.agent_name}* wants to call `{approval.tool_name}`:\n"
+                f"{args_preview}\n\n"
+                f"Reply YES to proceed or NO to cancel."
+            )
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to_phone,
+                "type": "text",
+                "text": {"body": message},
+            }
 
         import httpx
 
         url = f"https://graph.facebook.com/v21.0/{bot.phone_number_id}/messages"
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_phone,
-            "type": "text",
-            "text": {"body": message},
-        }
         async with httpx.AsyncClient(timeout=15.0) as client:
             await client.post(url, json=payload, headers={"Authorization": f"Bearer {access_token}"})
 
@@ -433,6 +470,63 @@ class HumanApprovalService:
 
         svc = WhatsAppWebService()
         svc.send_text_message(session_id, to_phone, message)
+
+    async def _send_telegram(self, approval: AgentApprovalRequest, channel_config: dict) -> dict:
+        """Send approval request to Telegram with inline Approve/Reject buttons.
+
+        Only used for trade proposals today (approval.tool_args carries proposal_id) — the
+        callback_data 'trade:<proposal_id>:<approve|reject>' is routed by
+        TelegramPollingService.handle_callback_query straight to execution_service, not through
+        this service's handle_reply().
+        """
+        from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+
+        from src.models.telegram_bot import TelegramBot
+        from src.services.agents.security import decrypt_value
+
+        bot_id = channel_config.get("bot_id")
+        chat_id = channel_config.get("chat_id")
+        if not bot_id or not chat_id:
+            logger.warning("Telegram approval missing bot_id or chat_id in channel_config")
+            return {}
+
+        telegram_bot = await self._db.get(TelegramBot, bot_id)
+        if not telegram_bot:
+            logger.warning(f"Telegram bot {bot_id} not found")
+            return {}
+
+        try:
+            token = decrypt_value(telegram_bot.bot_token)
+        except Exception:
+            token = telegram_bot.bot_token
+
+        args_preview = json.dumps(approval.tool_args, ensure_ascii=False)
+        if len(args_preview) > 300:
+            args_preview = args_preview[:297] + "..."
+
+        text = (
+            f"Action pending your approval.\n"
+            f"Agent {approval.agent_name} wants to call {approval.tool_name}:\n"
+            f"{args_preview}"
+        )
+
+        proposal_id = approval.tool_args.get("proposal_id") if isinstance(approval.tool_args, dict) else None
+        reply_markup = None
+        if proposal_id:
+            reply_markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Approve", callback_data=f"trade:{proposal_id}:approve"),
+                        InlineKeyboardButton("Reject", callback_data=f"trade:{proposal_id}:reject"),
+                    ]
+                ]
+            )
+        else:
+            text += "\n\nReply /link <code> first if you haven't linked your account yet."
+
+        bot = Bot(token=token)
+        message = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        return {"telegram_bot_id": str(telegram_bot.id), "chat_id": chat_id, "message_id": message.message_id}
 
     async def _send_chat(self, approval: AgentApprovalRequest, channel_config: dict) -> None:
         """Persist an approval prompt into the agent's autonomous memory conversation."""

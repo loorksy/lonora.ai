@@ -678,7 +678,7 @@ class BotWorker:
     def _register_telegram_handlers(self, application: Any, telegram_bot: TelegramBot) -> None:
         """Register message handlers for Telegram application."""
         from telegram import Update
-        from telegram.ext import CommandHandler, ContextTypes, MessageHandler, filters
+        from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
         # Import the actual message handler from existing service
         from ..services.telegram.telegram_polling_service import TelegramPollingService
@@ -747,7 +747,57 @@ class BotWorker:
                     context=context,
                 )
 
+        async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.effective_chat or not update.effective_user:
+                return
+            code = " ".join(context.args) if context and context.args else ""
+            if not code.strip():
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Usage: /link <code>. Generate a code from the Synkora web dashboard first.",
+                )
+                return
+
+            async with get_async_session_factory()() as db:
+                fresh_bot = await db.get(TelegramBot, bot_id)
+                if not fresh_bot:
+                    logger.error(f"Telegram bot {bot_id} not found in database")
+                    return
+
+                service = TelegramPollingService(db, agent_manager=shared_agent_manager)
+                await service.handle_link_command(
+                    telegram_bot=fresh_bot,
+                    chat_id=update.effective_chat.id,
+                    user_id=update.effective_user.id,
+                    code=code.strip(),
+                    bot=context.bot,
+                )
+
+        async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            if not query or not query.message or not update.effective_user:
+                return
+
+            async with get_async_session_factory()() as db:
+                fresh_bot = await db.get(TelegramBot, bot_id)
+                if not fresh_bot:
+                    logger.error(f"Telegram bot {bot_id} not found in database")
+                    return
+
+                service = TelegramPollingService(db, agent_manager=shared_agent_manager)
+                await service.handle_callback_query(
+                    telegram_bot=fresh_bot,
+                    chat_id=query.message.chat_id,
+                    user_id=update.effective_user.id,
+                    message_id=query.message.message_id,
+                    callback_data=query.data or "",
+                    callback_query_id=query.id,
+                    bot=context.bot,
+                )
+
         application.add_handler(CommandHandler("start", handle_start))
+        application.add_handler(CommandHandler("link", handle_link))
+        application.add_handler(CallbackQueryHandler(handle_callback_query))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async def _stop_bot(self, bot_id: str) -> bool:

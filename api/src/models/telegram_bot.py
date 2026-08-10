@@ -85,6 +85,16 @@ class TelegramConversation(Base):
     # Message tracking for replies
     last_bot_message_id = Column(BigInteger, nullable=True, comment="Last message ID sent by bot")
 
+    # Authenticated Synkora account this Telegram user has linked via /link — required before
+    # this chat can be used to approve a trade proposal (§16 of the trading domain spec).
+    # Ordinary chat access never requires this; only approval actions check it.
+    linked_account_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="Authenticated account linked via /link, required for trade approval actions",
+    )
+
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

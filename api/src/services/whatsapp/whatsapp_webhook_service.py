@@ -103,17 +103,35 @@ class WhatsAppWebhookService:
 
             # Extract message text based on type
             text = ""
+            button_reply_id = ""
             if message_type == "text":
                 text = message.get("text", {}).get("body", "")
             elif message_type == "interactive":
                 interactive = message.get("interactive", {})
                 if "button_reply" in interactive:
                     text = interactive["button_reply"].get("title", "")
+                    button_reply_id = interactive["button_reply"].get("id", "")
                 elif "list_reply" in interactive:
                     text = interactive["list_reply"].get("title", "")
 
             if not text:
                 logger.debug(f"No text content in WhatsApp message type {message_type}")
+                return
+
+            # Trade approval button tap ('trade:<proposal_id>:<approve|reject>') — routed straight
+            # to execution_service, bypassing the generic YES/NO text-reply HITL flow below, since
+            # it needs the tapper's linked account identity and the trading:approve permission
+            # check, not just a free-text approve/reject classification.
+            if button_reply_id.startswith("trade:"):
+                await self._handle_trade_button_reply(bot, from_number, button_reply_id)
+                return
+
+            # WhatsApp has no bot-command system — LINK <code> is a plain text message that
+            # associates this phone number with an authenticated Synkora account, required
+            # before trade approval buttons/replies from this number are honored.
+            _stripped_link = text.strip()
+            if _stripped_link.upper().startswith("LINK "):
+                await self._handle_link_command(bot, from_number, _stripped_link[5:].strip())
                 return
 
             # Feedback: intercept 👍/👎 as per-message satisfaction signal
@@ -262,6 +280,101 @@ class WhatsAppWebhookService:
         except Exception as e:
             logger.error(f"Error processing WhatsApp message: {str(e)}")
             await self.db_session.rollback()
+
+    async def _handle_trade_button_reply(self, bot: WhatsAppBot, from_number: str, button_reply_id: str) -> None:
+        """Handle a tap on an Approve/Reject trade-proposal button (id: 'trade:<proposal_id>:<decision>')."""
+        parts = button_reply_id.split(":")
+        if len(parts) != 3:
+            return
+        _, proposal_id, decision = parts
+
+        wa_conv_result = await self.db_session.execute(
+            select(WhatsAppConversation).where(
+                WhatsAppConversation.whatsapp_bot_id == bot.id,
+                WhatsAppConversation.whatsapp_user_id == from_number,
+            )
+        )
+        wa_conv = wa_conv_result.scalar_one_or_none()
+        if wa_conv is None or not wa_conv.linked_account_id:
+            await self._send_message(
+                bot,
+                from_number,
+                "Your WhatsApp number isn't linked to a Synkora account yet. Send LINK <code> first.",
+            )
+            return
+
+        from src.services.trading import execution_service
+
+        try:
+            if decision == "approve":
+                proposal = await execution_service.approve_proposal(
+                    self.db_session,
+                    tenant_id=str(bot.tenant_id),
+                    proposal_id=proposal_id,
+                    approver_account_id=str(wa_conv.linked_account_id),
+                )
+            elif decision == "reject":
+                proposal = await execution_service.reject_proposal(
+                    self.db_session,
+                    tenant_id=str(bot.tenant_id),
+                    proposal_id=proposal_id,
+                    approver_account_id=str(wa_conv.linked_account_id),
+                )
+            else:
+                return
+        except execution_service.ApprovalAuthorizationError as exc:
+            await self._send_message(bot, from_number, str(exc))
+            return
+        except execution_service.ProposalStateError as exc:
+            await self._send_message(bot, from_number, str(exc))
+            return
+
+        reply = f"Proposal {proposal.symbol} {proposal.action} — {proposal.status.value.upper()}"
+        if proposal.failure_reason:
+            reply += f"\nReason: {proposal.failure_reason}"
+        await self._send_message(bot, from_number, reply)
+
+    async def _handle_link_command(self, bot: WhatsAppBot, from_number: str, code: str) -> None:
+        """Handle 'LINK <code>' — links this WhatsApp number to an authenticated Synkora account."""
+        if not code:
+            await self._send_message(
+                bot, from_number, "Usage: LINK <code>. Generate a code from the Synkora web dashboard first."
+            )
+            return
+
+        from src.services.trading.channel_linking_service import resolve_link_code
+
+        resolved = await resolve_link_code(code)
+        if not resolved:
+            await self._send_message(
+                bot,
+                from_number,
+                "That link code is invalid or has expired. Generate a new one from the dashboard and try again.",
+            )
+            return
+
+        tenant_id, account_id = resolved
+        if str(bot.tenant_id) != tenant_id:
+            await self._send_message(bot, from_number, "That link code belongs to a different workspace.")
+            return
+
+        # Ensure a conversation mapping exists even if this is the user's first-ever message
+        await self._get_or_create_conversation(bot, from_number)
+        wa_conv_result = await self.db_session.execute(
+            select(WhatsAppConversation).where(
+                WhatsAppConversation.whatsapp_bot_id == bot.id,
+                WhatsAppConversation.whatsapp_user_id == from_number,
+            )
+        )
+        wa_conv = wa_conv_result.scalar_one_or_none()
+        if wa_conv is None:
+            return
+
+        wa_conv.linked_account_id = UUID(account_id)
+        await self.db_session.commit()
+        await self._send_message(
+            bot, from_number, "Linked! You can now approve/reject trade proposals from this WhatsApp number."
+        )
 
     async def _get_or_create_conversation(self, bot: WhatsAppBot, user_phone: str) -> Conversation:
         """

@@ -49,6 +49,41 @@ def _context(runtime_context: Any) -> tuple[str | None, str | None, str | None, 
     )
 
 
+async def _resolve_notification_channel(db: Any, conversation_id: str | None) -> tuple[str, dict]:
+    """Detect which channel this conversation is running on so the approval notification lands
+    there (Telegram inline buttons, WhatsApp interactive buttons) instead of the generic in-chat
+    HITL prompt. Falls back to "chat" when the conversation isn't linked to any bot conversation."""
+    if not conversation_id:
+        return "chat", {}
+
+    from sqlalchemy import select
+
+    from src.models.telegram_bot import TelegramConversation
+    from src.models.whatsapp_bot import WhatsAppBot, WhatsAppConversation
+
+    conv_uuid = uuid.UUID(conversation_id)
+
+    result = await db.execute(select(TelegramConversation).where(TelegramConversation.conversation_id == conv_uuid))
+    tg_conv = result.scalar_one_or_none()
+    if tg_conv is not None:
+        return "telegram", {"bot_id": str(tg_conv.telegram_bot_id), "chat_id": tg_conv.telegram_chat_id}
+
+    result = await db.execute(select(WhatsAppConversation).where(WhatsAppConversation.conversation_id == conv_uuid))
+    wa_conv = result.scalar_one_or_none()
+    if wa_conv is not None:
+        wa_bot = await db.get(WhatsAppBot, wa_conv.whatsapp_bot_id)
+        if wa_bot is not None and wa_bot.connection_type == "cloud_api":
+            return "whatsapp", {"bot_id": str(wa_conv.whatsapp_bot_id), "to_phone": wa_conv.whatsapp_user_id}
+        # device_link (QR) bots run on WhatsAppDeviceLinkManager, which has no message-send entry
+        # point outside its own connection thread — the platform's existing "whatsapp_web"
+        # notification channel only works during an active QR-linking session, not for a
+        # long-running connected bot. Fall back to the in-chat HITL prompt rather than silently
+        # failing to deliver a trade approval notification.
+        return "chat", {}
+
+    return "chat", {}
+
+
 async def _propose(request: ProposalRequest, runtime_context: Any, agent_name: str) -> dict[str, Any]:
     tenant_id, user_id, agent_id, conversation_id = _context(runtime_context)
     if not tenant_id or not user_id or not agent_id:
@@ -57,6 +92,9 @@ async def _propose(request: ProposalRequest, runtime_context: Any, agent_name: s
 
     try:
         async for db in get_async_db():
+            request.notification_channel, request.channel_config = await _resolve_notification_channel(
+                db, conversation_id
+            )
             proposal = await proposal_service.create_proposal(
                 db, tenant_id=tenant_id, account_id=user_id, agent_id=agent_id, agent_name=agent_name, request=request
             )

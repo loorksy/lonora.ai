@@ -37,6 +37,7 @@ import * as projects from './projects'
 import * as roles from './roles'
 import * as chatConfig from './chat-config'
 import * as agentLens from './agent-lens'
+import * as trading from './trading'
 
 // Backwards-compatible wrappers for chat config (original signatures differ from typed module)
 async function _getChatConfig(agentId: string): Promise<any> {
@@ -282,6 +283,14 @@ interface ExtendedAPIClient extends APIClient {
   createLensAlert: typeof agentLens.createLensAlert
   updateLensAlert: typeof agentLens.updateLensAlert
   deleteLensAlert: typeof agentLens.deleteLensAlert
+
+  // Trading
+  getTradeProposals: typeof trading.getTradeProposals
+  getTradeProposal: typeof trading.getTradeProposal
+  approveTradeProposal: typeof trading.approveTradeProposal
+  rejectTradeProposal: typeof trading.rejectTradeProposal
+  generateChannelLinkCode: typeof trading.generateChannelLinkCode
+  getTradingAccounts: typeof trading.getTradingAccounts
 }
 
 // Compose the extended apiClient with all domain methods
@@ -517,6 +526,14 @@ export const apiClient: ExtendedAPIClient = Object.assign(_apiClient, {
   createLensAlert: agentLens.createLensAlert,
   updateLensAlert: agentLens.updateLensAlert,
   deleteLensAlert: agentLens.deleteLensAlert,
+
+  // Trading
+  getTradeProposals: trading.getTradeProposals,
+  getTradeProposal: trading.getTradeProposal,
+  approveTradeProposal: trading.approveTradeProposal,
+  rejectTradeProposal: trading.rejectTradeProposal,
+  generateChannelLinkCode: trading.generateChannelLinkCode,
+  getTradingAccounts: trading.getTradingAccounts,
 }) as ExtendedAPIClient
 
 // Export the APIClient class for typing purposes
@@ -541,3 +558,4 @@ export * from './projects'
 export * from './roles'
 export * from './chat-config'
 export * from './agent-lens'
+export * from './trading'

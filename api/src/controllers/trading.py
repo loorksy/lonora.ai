@@ -29,7 +29,7 @@ from src.middleware.auth_middleware import get_current_account, get_current_tena
 from src.models.tenant import Account
 from src.models.trade_proposal import TradeProposal, TradeProposalStatus
 from src.models.trading_account import TradingAccount
-from src.services.trading import execution_service, market_data_service
+from src.services.trading import channel_linking_service, execution_service, market_data_service
 from src.services.trading.broker_credential_service import get_metaapi_client
 from src.services.trading.brokers.base import BrokerError
 
@@ -49,6 +49,23 @@ class LinkTradingAccountRequest(BaseModel):
 
 class ApproveRejectRequest(BaseModel):
     reason: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Channel identity linking (§16/§17)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/channel-link/generate")
+async def generate_channel_link_code(
+    tenant_id: uuid.UUID = Depends(get_current_tenant_id),
+    current_account: Account = Depends(get_current_account),
+):
+    """Generate a short-lived one-time code the caller sends to a Telegram/WhatsApp bot
+    (`/link <code>` or `LINK <code>`) to link that channel identity to their account for
+    trade-approval purposes. Valid for 10 minutes, single-use."""
+    code = await channel_linking_service.generate_link_code(tenant_id, current_account.id)
+    return {"success": True, "data": {"code": code, "expires_in_seconds": 600}}
 
 
 # ---------------------------------------------------------------------------

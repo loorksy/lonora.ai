@@ -48,7 +48,7 @@ full `pytest` suite and `alembic upgrade head` in a real dev/CI environment**
 | 3. Trading Agent (config, system prompt, tool allow-list) | ✅ Done | |
 | 4. Trading charts (klinecharts, web) | ✅ Done | |
 | 5. Approval-gated proposals (risk engine, position sizing, RBAC, execution) | ✅ Done | See below — includes a pre-existing platform bug fix |
-| 6. Telegram + WhatsApp (buttons, chart images) | ⬜ Not started | |
+| 6. Telegram + WhatsApp (buttons, chart images) | ✅ Done | Includes a minimal web dashboard page |
 | 7. MCP Apps / ext-apps investigation | ⬜ Not started | |
 | 8. Production hardening (observability, docs, rate limiting) | ⬜ Not started | |
 
@@ -374,5 +374,183 @@ as the rest of the platform.
   EXECUTED) in a real dev environment before this ships.
 - Migration re-verified with a full up/down/up round-trip after the
   `volume` nullable change.
+
+---
+
+## Phase 6 — Telegram + WhatsApp approval buttons ✅ (commit pending)
+
+**Goal**: let a human approve/reject a pending `TradeProposal` from Telegram
+or WhatsApp with a button tap, not just the REST API — closing the gap the
+plan flagged (§Modification Map: "audit found NO inline-keyboard
+construction and NO `callback_query` handler exist today" / "audit found no
+`type: interactive` message ever sent"). Also adds the missing piece for
+market-data/chat access: a Trading Agent is reachable via Telegram/WhatsApp
+today with **zero setup** (any tenant admin attaches a `TelegramBot`/
+`WhatsAppBot` row the same way as any other agent) — this phase only adds
+what's new, the **approval identity** path, which is opt-in and separate.
+
+### New/changed files
+
+- `api/src/models/telegram_bot.py`, `api/src/models/whatsapp_bot.py` —
+  added nullable `linked_account_id` (FK → `accounts.id`, `ON DELETE
+  SET NULL`) to `TelegramConversation`/`WhatsAppConversation`. Ordinary
+  chat never requires this; only approve/reject actions from that channel
+  check it.
+- `api/migrations/versions/20260811_0001_add_channel_identity_linking.py`
+  — idempotent, adds both columns. Verified with a full up/down/up
+  round-trip against real local Postgres.
+- `api/src/services/trading/channel_linking_service.py` (new) —
+  `generate_link_code(tenant_id, account_id) -> code` /
+  `resolve_link_code(code) -> (tenant_id, account_id) | None`. 8-hex-char
+  code, Redis-backed, 10-minute TTL, single-use (deleted on read).
+- `api/src/services/charts/chart_image_renderer.py` — generalized from
+  `services/slack/slack_chart_renderer.py` (moved via `git mv`, history
+  preserved). Added `render_trading_chart_to_png()` for a
+  `TradingChartData`-shaped dict (candles + entry/SL/TP/S-R/trendline
+  overlays) → PNG bytes, returns `None` on failure rather than raising.
+  `slack_message_handler.py`'s one import site updated.
+- `api/src/services/telegram/telegram_polling_service.py` — added
+  `handle_link_command()` (`/link <code>`) and `handle_callback_query()`
+  (`trade:<proposal_id>:<approve|reject>` callback_data), routing straight
+  to `execution_service.approve_proposal`/`reject_proposal` — **not**
+  through the platform's generic `HumanApprovalService.handle_reply()`,
+  same design decision `execution_service.py` already documented in Phase
+  5 (a financial order needs its own MetaApi revalidation, not a re-fired
+  agent run).
+- `api/src/bot_worker/worker.py::_register_telegram_handlers` — wired the
+  two methods above via `CommandHandler("link", ...)` and a new
+  `CallbackQueryHandler(...)`, following the exact existing closure
+  pattern (fresh DB session + fresh bot row per update).
+- `api/src/services/whatsapp/whatsapp_webhook_service.py` — WhatsApp has
+  no bot-command system, so `LINK <code>` is a plain inbound text message
+  (`_handle_link_command`); an Approve/Reject button tap arrives as
+  `interactive.button_reply.id` (`_handle_trade_button_reply`), checked
+  **before** the existing generic YES/NO HITL text-reply flow so trade
+  taps never get misrouted into it.
+- `api/src/services/human_approval_service.py` — added a `"telegram"`
+  notification channel (`_send_telegram`: inline `Approve`/`Reject`
+  keyboard via `InlineKeyboardMarkup`, callback_data
+  `trade:<proposal_id>:<approve|reject>`). Extended `_send_whatsapp_business`
+  to send a WhatsApp Cloud API interactive button message when
+  `approval.tool_args` carries a `proposal_id` (i.e. a trade proposal);
+  every other (non-trading) approval on that channel keeps the original
+  plain YES/NO text prompt unchanged.
+- `api/src/services/agents/internal_tools/trading_execution_tools.py` —
+  new `_resolve_notification_channel(db, conversation_id)`: looks up
+  whether the conversation that triggered a `propose_*_order` tool call is
+  a `TelegramConversation` or a `WhatsAppConversation` (cloud_api only —
+  see limitation below) and, if so, routes the approval notification to
+  that channel with the right `{bot_id, chat_id}`/`{bot_id, to_phone}`
+  instead of the generic in-chat prompt. `ProposalRequest` gained a
+  `channel_config` override field (`proposal_service.py`) to carry this
+  through `HumanApprovalService.create_and_notify`.
+- `api/src/controllers/trading.py` — `POST /api/v1/trading/channel-link/generate`,
+  returns a one-time code for the authenticated account (used by both the
+  new web page and directly by API consumers).
+- **Web**: `web/lib/api/trading.ts` (new, wired into `lib/api/client.ts`'s
+  barrel per the existing per-domain-module convention) +
+  `web/app/(dashboard)/trading/page.tsx` (new) — a minimal dashboard page:
+  lists proposals by status with Approve/Reject buttons, and a "Link
+  Telegram / WhatsApp" modal that generates and displays a code. Sidebar
+  entry added in `web/components/layout/Sidebar.tsx`. This was implied but
+  not built in Phase 5 (approval only existed via raw REST + Telegram/
+  WhatsApp built in this phase) — added now so there's at least one
+  authenticated-human-in-the-loop surface that doesn't require a bot.
+
+### Known limitation (documented, not silently swallowed)
+
+WhatsApp **device_link (QR-linked)** bots cannot receive the interactive-
+button notification or plain-text HITL fallback either — audited and found
+that the platform's existing `whatsapp_web` notification channel
+(`HumanApprovalService._send_whatsapp_web` → `WhatsAppWebService.send_text_message`)
+is **pre-existing, unrelated-to-this-work dead code for a persistent
+connection**: it only has a live client during an active QR-linking
+session (`web/...` → `WhatsAppWebService.start_session`), while actual
+long-running device-link bots are driven by a completely separate
+`WhatsAppDeviceLinkManager` (keyed by `bot_id`, its own neonize client per
+thread) that `WhatsAppWebService` never populates. `_resolve_notification_channel`
+detects this case and deliberately falls back to the generic in-chat
+`"chat"` HITL prompt rather than silently trying to send through a
+channel that would fail. **Not fixed here** — unifying
+`WhatsAppDeviceLinkManager`/`WhatsAppWebService` is a pre-existing platform
+gap outside this phase's scope; flagging it for whoever next touches
+WhatsApp device-link notifications.
+
+### Verification depth
+
+Real `python-telegram-bot` isn't installed in this sandbox (only declared
+in `pyproject.toml`), so a minimal fake `telegram`/`telegram.ext` module
+(just enough surface — `Bot.send_message`/`answer_callback_query`/
+`edit_message_text`, `InlineKeyboardButton`, `InlineKeyboardMarkup`) stood
+in for it; all business logic under test is the real, unmodified
+production code, only the third-party network client is faked. All tests
+below ran against a real local Postgres 16 test database + real
+`redis-server`, per the methodology established in earlier phases:
+
+- **`_resolve_notification_channel`** — 5/5 cases against real Postgres:
+  Telegram conversation → `("telegram", {bot_id, chat_id})`; WhatsApp
+  cloud_api conversation → `("whatsapp", {bot_id, to_phone})`; WhatsApp
+  device_link conversation → falls back to `("chat", {})`; unknown
+  conversation_id → `("chat", {})`; `None` conversation_id → `("chat", {})`
+  with no DB query issued.
+- **WhatsApp inbound flow** (`WhatsAppWebhookService._handle_link_command`/
+  `_handle_trade_button_reply`, real production code, `_send_message` and
+  `execution_service` mocked) — 8/8 cases: invalid link code rejected;
+  mismatched-tenant link code rejected; successful link persists
+  `linked_account_id` in `whatsapp_conversations`; link code is single-use
+  (second use rejected); button tap from an unlinked number rejected;
+  approve button tap calls `execution_service.approve_proposal` with the
+  linked account's identity and replies with the new status; reject button
+  tap calls `reject_proposal`; a malformed `button_reply.id` is a no-op.
+- **Telegram inbound flow** (`TelegramPollingService.handle_link_command`/
+  `handle_callback_query`, real production code) — 10/10 cases: `/link`
+  with invalid code, with mismatched tenant, and before the user has ever
+  messaged the bot (no `TelegramConversation` row yet — correctly asks the
+  user to message the bot first rather than crashing on a missing row);
+  successful `/link` persists `linked_account_id`; `callback_query` from
+  an unlinked chat/user rejected; approve routes to
+  `execution_service.approve_proposal` with the linked identity and edits
+  the Telegram message to show the new status; reject routes to
+  `reject_proposal`; `ApprovalAuthorizationError` surfaces as a Telegram
+  alert (`show_alert=True`) instead of crashing; malformed `callback_data`
+  is acknowledged and ignored.
+- **`HumanApprovalService._send_telegram`** — verified it builds the
+  correct `InlineKeyboardMarkup` (`trade:<id>:approve`/`trade:<id>:reject`
+  callback_data) for a trade-proposal approval and returns the right
+  `notification_ref`.
+- **`HumanApprovalService._send_whatsapp_business`** — verified it sends a
+  `type: interactive` button payload with the correct button ids for a
+  trade proposal, and confirmed the **generic (non-trading) approval path
+  is unchanged** (still `type: text` with the original YES/NO prompt) —
+  i.e. this change is additive and doesn't alter existing Slack/WhatsApp
+  HITL behavior for non-trading autonomous-agent approvals.
+- `chart_image_renderer.py`'s `render_trading_chart_to_png` was already
+  verified in the prior session (50-candle synthetic dataset with all
+  overlay types → real PNG; malformed input → `None`, no exception).
+- **Web**: `tsc --noEmit` and `eslint` clean on all new/changed frontend
+  files (`lib/api/trading.ts`, `lib/api/client.ts`, the new page,
+  `Sidebar.tsx`) — the one `tsc` error in the full-project run is a
+  pre-existing, gitignored, stale `.next/dev/types` artifact referencing a
+  Phase-4 test page, unrelated to this change. Loaded `/trading` in a real
+  `next dev` + headless Chromium session: page compiles and serves, no
+  React/module errors — it correctly redirects into the auth flow because
+  no backend/API server is running in this sandbox, identical behavior to
+  every other `(dashboard)/*` page under the same conditions. **Not**
+  visually verified against a real logged-in session with real proposal
+  data — recommend a manual click-through (generate a proposal, approve
+  it from the web page, from Telegram, and from WhatsApp separately,
+  confirm exactly one `EXECUTED` row and matching `ActivityLog` entries
+  for each) in a real dev environment before this ships, same
+  recommendation Phase 5 made for the end-to-end proposal flow generally.
+- `py_compile` + `ruff check` + `ruff format --check` clean on every
+  touched/created Python file — cross-checked against each file's
+  pre-Phase-6 (`git show HEAD:...`) lint output file-by-file to confirm
+  the **exact same** pre-existing finding count survives unchanged (no new
+  issues introduced, no pre-existing issues silently fixed as a
+  side-effect): `worker.py` 6=6, `trading_execution_tools.py` 1=1,
+  `proposal_service.py` 1=1, `human_approval_service.py` 2=2,
+  `whatsapp_webhook_service.py` 3=3, `controllers/trading.py` 1=1,
+  `telegram_polling_service.py` 4=4, `models/telegram_bot.py` 1=1,
+  `models/whatsapp_bot.py` 1=1.
 
 ---

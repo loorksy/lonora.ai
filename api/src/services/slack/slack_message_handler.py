@@ -670,9 +670,9 @@ class SlackMessageHandler:
     ) -> None:
         """Render each chart to PNG and upload to Slack."""
         try:
-            from .slack_chart_renderer import render_chart_to_png
+            from src.services.charts.chart_image_renderer import render_chart_to_png
         except ImportError:
-            logger.warning("slack_chart_renderer not available — skipping chart upload")
+            logger.warning("chart_image_renderer not available — skipping chart upload")
             return
 
         for i, chart in enumerate(charts):

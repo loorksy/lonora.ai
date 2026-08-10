@@ -1,7 +1,16 @@
-"""Server-side chart rendering for Slack using matplotlib.
+"""Server-side chart-to-PNG rendering using matplotlib.
 
-Converts Chart.js / Recharts / Plotly-style JSON configs produced by the agent
-into PNG bytes that can be uploaded directly to Slack via files_upload_v2.
+Converts Chart.js / Recharts / Plotly-style JSON configs produced by the
+agent into PNG bytes for channels that can't render interactive charts —
+originally built for Slack (`files_upload_v2`), reused as-is for Telegram
+(`send_photo`) and WhatsApp (Cloud API media upload) rather than building a
+separate renderer per channel (§18 of the trading domain spec: "Do not
+maintain two independent trading-data pipelines").
+
+Also renders trading candlestick charts (`render_trading_chart_to_png`) —
+the static-image fallback for the interactive klinecharts view used on web
+(see web/lib/types/trading.ts for the shared `TradingChartData` shape this
+mirrors on the Python side).
 """
 
 from __future__ import annotations
@@ -218,6 +227,105 @@ def _render_chartjs_pie(chart: dict[str, Any], donut: bool = False) -> bytes:
 
     fig.tight_layout()
     return _to_png(fig)
+
+
+# ── Trading candlestick (Telegram/WhatsApp static fallback for klinecharts) ──
+
+
+def _render_candlestick(trading_chart: dict[str, Any]) -> bytes:
+    """Render a TradingChartData-shaped dict (bars + overlays) to a static candlestick PNG.
+
+    Mirrors web/lib/types/trading.ts's TradingChartData: {symbol, timeframe,
+    source, bars: [{time,open,high,low,close,volume}], overlays: {entry,
+    stopLoss, takeProfit[], supportResistance[], trendlines[]}}.
+    """
+    import matplotlib
+    import matplotlib.dates as mdates
+
+    matplotlib.use("Agg")
+    from datetime import datetime
+
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
+
+    bars = trading_chart.get("bars") or []
+    if not bars:
+        raise ValueError("No bars in trading chart data")
+
+    symbol = trading_chart.get("symbol", "")
+    timeframe = trading_chart.get("timeframe", "")
+    source = trading_chart.get("source", "")
+    overlays = trading_chart.get("overlays") or {}
+
+    times = [datetime.fromisoformat(str(b["time"]).replace("Z", "+00:00")) for b in bars]
+    x = mdates.date2num(times)
+    # Half a bar-width in x-axis units, for candle body/wick rendering.
+    half_width = (x[1] - x[0]) * 0.35 if len(x) > 1 else 0.3
+
+    fig, ax = _setup_figure(f"{symbol} · {timeframe}  ({source})", figsize=(11, 6))
+
+    for xi, bar in zip(x, bars, strict=False):
+        o, h, low, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
+        up = c >= o
+        color = "#16a34a" if up else "#dc2626"
+        ax.add_line(Line2D([xi, xi], [low, h], color=color, linewidth=1, zorder=2))
+        body_bottom, body_height = (o, c - o) if up else (c, o - c)
+        body_height = max(body_height, (h - low) * 0.01)  # ensure a visible sliver on doji bars
+        ax.add_patch(
+            Rectangle(
+                (xi - half_width, body_bottom), half_width * 2, body_height, facecolor=color, edgecolor=color, zorder=3
+            )
+        )
+
+    def _hline(value: float, label: str, color: str) -> None:
+        ax.axhline(value, color=color, linestyle="--", linewidth=1, zorder=1)
+        ax.text(x[-1], value, f" {label} {value:g}", color=color, fontsize=8, va="center", fontweight="bold")
+
+    if overlays.get("entry") is not None:
+        _hline(float(overlays["entry"]), "Entry", "#2563eb")
+    if overlays.get("stopLoss") is not None:
+        _hline(float(overlays["stopLoss"]), "SL", "#dc2626")
+    for i, tp in enumerate(overlays.get("takeProfit") or []):
+        _hline(float(tp), f"TP{i + 1}", "#16a34a")
+    for level in overlays.get("supportResistance") or []:
+        _hline(float(level), "S/R", "#9333ea")
+
+    for tl in overlays.get("trendlines") or []:
+        start, end = tl.get("start") or {}, tl.get("end") or {}
+        if "time" not in start or "time" not in end:
+            continue
+        sx = mdates.date2num(datetime.fromisoformat(str(start["time"]).replace("Z", "+00:00")))
+        ex = mdates.date2num(datetime.fromisoformat(str(end["time"]).replace("Z", "+00:00")))
+        ax.add_line(
+            Line2D(
+                [sx, ex],
+                [float(start["price"]), float(end["price"])],
+                color=tl.get("color") or "#f59e0b",
+                linewidth=1.5,
+                zorder=2,
+            )
+        )
+
+    ax.xaxis_date()
+    fig.autofmt_xdate()
+    ax.set_xlim(x[0] - half_width * 3, x[-1] + half_width * 8)  # leave room for overlay labels on the right
+
+    fig.tight_layout()
+    return _to_png(fig)
+
+
+def render_trading_chart_to_png(trading_chart: dict[str, Any]) -> bytes | None:
+    """Render a TradingChartData dict (candles + entry/SL/TP/S-R/trendline overlays) to PNG.
+
+    Returns None on failure (e.g. malformed bar data) rather than raising —
+    callers (Telegram/WhatsApp senders) should treat this the same as
+    render_chart_to_png returning None: skip the image, never fabricate one.
+    """
+    try:
+        return _render_candlestick(trading_chart)
+    except Exception as e:
+        logger.warning(f"[ChartImageRenderer] Failed to render trading chart '{trading_chart.get('symbol', '')}': {e}")
+        return None
 
 
 # ── Recharts / generic bar / line (table_data path) ──────────────────────────

@@ -55,6 +55,10 @@ class ProposalRequest:
     oanda_reference_price_at: datetime | None = None
     conversation_id: str | None = None
     notification_channel: str = "chat"
+    # Overrides the default {"conversation_id": ...} channel_config — set by the caller when the
+    # conversation is running on a channel (Telegram/WhatsApp) that needs its own routing info
+    # (bot_id, chat_id/phone) to deliver the approval notification there instead of in-chat.
+    channel_config: dict | None = None
     timeout_minutes: int = 60
 
 
@@ -239,7 +243,11 @@ async def create_proposal(
 
     timeout_minutes = request.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES
     approval_service = HumanApprovalService(db)
-    channel_config = {"conversation_id": request.conversation_id} if request.conversation_id else {}
+    channel_config = (
+        request.channel_config
+        if request.channel_config is not None
+        else ({"conversation_id": request.conversation_id} if request.conversation_id else {})
+    )
     approval_result = await approval_service.create_and_notify(
         task_id=None,
         agent_id=uuid.UUID(str(agent_id)),

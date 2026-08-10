@@ -477,6 +477,105 @@ class TelegramPollingService:
 
         return conversation
 
+    # ------------------------------------------------------------------
+    # Trading identity linking + trade-approval buttons (§16 of the trading domain spec)
+    # ------------------------------------------------------------------
+
+    async def handle_link_command(
+        self, telegram_bot: TelegramBot, chat_id: int, user_id: int, code: str, bot: Bot
+    ) -> None:
+        """Handle /link <code> — links this Telegram user to an authenticated Synkora account."""
+        from ...services.trading.channel_linking_service import resolve_link_code
+
+        resolved = await resolve_link_code(code)
+        if not resolved:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="That link code is invalid or has expired. Generate a new one from the dashboard and try again.",
+            )
+            return
+
+        tenant_id, account_id = resolved
+        if str(telegram_bot.tenant_id) != tenant_id:
+            await bot.send_message(chat_id=chat_id, text="That link code belongs to a different workspace.")
+            return
+
+        tg_conv = await self._get_telegram_conversation(telegram_bot.id, chat_id, user_id)
+        if tg_conv is None:
+            await bot.send_message(chat_id=chat_id, text="Send a message to the bot first, then try /link again.")
+            return
+
+        tg_conv.linked_account_id = UUID(account_id)
+        await self.db_session.commit()
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Linked! You can now approve/reject trade proposals from this chat, if your account holds approval authority.",
+        )
+
+    async def handle_callback_query(
+        self,
+        telegram_bot: TelegramBot,
+        chat_id: int,
+        user_id: int,
+        message_id: int,
+        callback_data: str,
+        callback_query_id: str,
+        bot: Bot,
+    ) -> None:
+        """Handle inline-keyboard button taps for trade proposal approve/reject (callback_data: 'trade:<proposal_id>:<approve|reject>')."""
+        from ...services.trading import execution_service
+
+        parts = callback_data.split(":")
+        if len(parts) != 3 or parts[0] != "trade":
+            await bot.answer_callback_query(callback_query_id)
+            return
+        _, proposal_id, decision = parts
+
+        tg_conv = await self._get_telegram_conversation(telegram_bot.id, chat_id, user_id)
+        if tg_conv is None or not tg_conv.linked_account_id:
+            await bot.answer_callback_query(
+                callback_query_id,
+                text="Your Telegram account isn't linked yet. Send /link <code> first.",
+                show_alert=True,
+            )
+            return
+
+        try:
+            if decision == "approve":
+                proposal = await execution_service.approve_proposal(
+                    self.db_session,
+                    tenant_id=str(telegram_bot.tenant_id),
+                    proposal_id=proposal_id,
+                    approver_account_id=str(tg_conv.linked_account_id),
+                )
+            elif decision == "reject":
+                proposal = await execution_service.reject_proposal(
+                    self.db_session,
+                    tenant_id=str(telegram_bot.tenant_id),
+                    proposal_id=proposal_id,
+                    approver_account_id=str(tg_conv.linked_account_id),
+                )
+            else:
+                await bot.answer_callback_query(callback_query_id)
+                return
+        except execution_service.ApprovalAuthorizationError as exc:
+            await bot.answer_callback_query(callback_query_id, text=str(exc), show_alert=True)
+            return
+        except execution_service.ProposalStateError as exc:
+            await bot.answer_callback_query(callback_query_id, text=str(exc), show_alert=True)
+            return
+
+        await bot.answer_callback_query(callback_query_id, text=f"Proposal {proposal.status.value}.")
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"Proposal {proposal.symbol} {proposal.action} — {proposal.status.value.upper()}"
+                + (f"\nReason: {proposal.failure_reason}" if proposal.failure_reason else ""),
+            )
+        except Exception:
+            logger.debug("Could not edit Telegram message after approval decision (non-fatal)", exc_info=True)
+
     async def get_bot_status(self, telegram_bot_id: UUID) -> dict[str, Any]:
         """Get status of a Telegram bot."""
         bot_id_str = str(telegram_bot_id)

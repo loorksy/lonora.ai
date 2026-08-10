@@ -73,6 +73,16 @@ class WhatsAppConversation(Base):
     whatsapp_user_id = Column(String(255), nullable=False, comment="WhatsApp user phone number")
     whatsapp_user_name = Column(String(255), nullable=True)
 
+    # Authenticated Synkora account this WhatsApp user has linked — required before this chat
+    # can be used to approve a trade proposal (§17 of the trading domain spec). Ordinary chat
+    # access never requires this; only approval actions check it.
+    linked_account_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("accounts.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="Authenticated account linked via the LINK command, required for trade approval actions",
+    )
+
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
