@@ -494,6 +494,13 @@ class ADKToolRegistry:
 
         register_handoff_tools(self)
 
+        # Trading tools (read-only) - use modular registry
+        from src.services.agents.tool_registrations.trading_tools_registry import (
+            register_trading_tools,
+        )
+
+        register_trading_tools(self)
+
         # Multi-agent transfer tool
         self.register_tool(
             name="transfer_to_agent",
